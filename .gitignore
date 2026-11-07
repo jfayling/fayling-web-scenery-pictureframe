@@ -1,0 +1,11 @@
+node_modules/
+# local screenshot captures written by server.mjs (/__shot) and test shots
+shots/
+# local tooling
+.claude/
+# OS and editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.log

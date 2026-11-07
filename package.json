@@ -1,0 +1,15 @@
+{
+  "name": "fayling-web-scenery-pictureframe",
+  "version": "1.0.0",
+  "description": "Large-screen WebGPU aerial scenery picture frame: procedural forested landscapes seen from a slow flight, with a physically based sky, clock, and live weather.",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "build": "node build.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  }
+}
