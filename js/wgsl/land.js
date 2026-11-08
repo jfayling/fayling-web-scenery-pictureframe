@@ -178,6 +178,13 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
   let bar = (1.0 - smoothstep(0.1, 0.8, above + n2 * 0.3)) * (1.0 - smoothstep(0.05, 0.3, dens));
   let barC = mix(vec3f(0.16, 0.145, 0.115), vec3f(0.07, 0.065, 0.055), smoothstep(-0.3, 0.3, n1));
   c = mix(c, barC * (0.9 + 0.2 * n2), bar);
+  if (F.water.w > 0.5) {
+    let beach = (1.0 - smoothstep(0.3, 8.0, above)) * (1.0 - smoothstep(0.02, 0.4, dens));
+    var sand = vec3f(0.46, 0.39, 0.26);
+    sand *= 0.78 + 0.32 * n2 + 0.12 * n1;
+    sand *= mix(0.62, 1.0, smoothstep(0.05, 1.4, above));
+    c = mix(c, sand, beach);
+  }
   // rock: granite greys (dark basalt in the tropics), darker in clefts, lighter on ribs
   let strata = snoise(vec2f((xz.x + xz.y) * 0.004, above * 0.09)) * 0.5 + 0.5;
   var rk = mix(vec3f(0.12, 0.115, 0.10), vec3f(0.19, 0.18, 0.16), strata);
@@ -191,6 +198,7 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
   let face = fbm2(xz * (1.0 / 420.0) + vec2f(above * 0.0015, 6.3), 3);
   rk *= 0.55 + 0.75 * smoothstep(-0.45, 0.45, face);
   rk *= clamp(1.0 + curv * 5.0, 0.55, 1.25) * (0.85 + 0.3 * n2);
+  if (F.water.w > 0.5) { rk = mix(rk, rk * vec3f(1.25, 0.92, 0.72), 0.55); }
   c = mix(c, rk, rock);
   // lichen and scree tint above the treeline
   c = mix(c, vec3f(0.85, 0.87, 0.9), snow);
@@ -256,9 +264,16 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
     }
     let t = F.camPos.w;
     let detail = 1.0 - smoothstep(0.6, 6.0, fp);
-    let r1 = gnoised(xz * (1.0 / 7.0) - flow * t * (1.0 / 7.0) + vec2f(0.0, t * 0.02));
-    let r2 = gnoised(xz * (1.0 / 2.3) - flow * t * (1.3 / 2.3) + vec2f(t * 0.05, 0.0));
-    let sl = r1.yz * 0.021 + r2.yz * 0.018 * detail;
+    let ocean = F.water.w > 0.5;
+    let k1 = select(1.0 / 7.0, 1.0 / 48.0, ocean);
+    let k2 = select(1.0 / 2.3, 1.0 / 13.0, ocean);
+    let r1 = gnoised(xz * k1 - flow * t * k1 + vec2f(0.0, t * select(0.02, 0.006, ocean)));
+    let r2 = gnoised(xz * k2 - flow * t * select(1.3, 0.55, ocean) * k2 + vec2f(t * select(0.05, 0.015, ocean), 0.0));
+    var sl = r1.yz * select(0.021, 0.06, ocean) + r2.yz * select(0.018, 0.026, ocean) * detail;
+    if (ocean) {
+      let swell = gnoised(vec2f(xz.x * 0.0036 + t * 0.01, xz.y * 0.0024 + t * 0.003));
+      sl += swell.yz * 0.1;
+    }
     let n = normalize(vec3f(-sl.x, 1.0, -sl.y));
     // unresolved ripples widen the sun glint with distance
     let rough = 0.05 + 0.10 * smoothstep(0.5, 30.0, fp) + wet * 0.14;
@@ -270,21 +285,34 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
     // the wooded banks darken the reflection near the shore
     let bankK = (1.0 - smoothstep(0.2, 3.5, depth)) * smoothstep(0.0, 0.4, 1.0 - R.y);
     let bankCol = standAlbedo(0.5) * (lt.sun * sunVis * 0.25 + ambient(lt, Nt)) * (0.9 / PI);
-    refl = mix(refl, bankCol, bankK * 0.75);
+    refl = mix(refl, bankCol, bankK * select(0.75, 0.12, ocean));
     let Hs = normalize(V + lt.L);
     let NdL = max(dot(n, lt.L), 0.0);
     var glint = lt.sun * sunVis * ggx(max(dot(n, Hs), 0.0), rough) * schlick(dot(V, Hs), 0.02) * NdL / (4.0 * NdV);
     let tannin = F.water.z;
-    let deep = mix(vec3f(0.006, 0.016, 0.016), vec3f(0.016, 0.010, 0.004), tannin);
-    let bed = groundAlbedo(xz, fp, 0.5, 0.0, 0.0, 0.0, 0.0) * mix(vec3f(0.7, 0.85, 0.8), vec3f(0.8, 0.6, 0.35), tannin);
+    var deep = mix(vec3f(0.006, 0.016, 0.016), vec3f(0.016, 0.010, 0.004), tannin);
+    var bed = groundAlbedo(xz, fp, 0.5, 0.0, 0.0, 0.0, 0.0) * mix(vec3f(0.7, 0.85, 0.8), vec3f(0.8, 0.6, 0.35), tannin);
+    var extK = mix(vec3f(0.45, 0.16, 0.12), vec3f(0.35, 0.55, 0.9), tannin);
+    if (ocean) {
+      deep = vec3f(0.004, 0.026, 0.052);
+      bed = vec3f(0.52, 0.44, 0.30) * (0.86 + 0.22 * snoise(xz * 0.03));
+      extK = vec3f(0.15, 0.045, 0.03);
+    }
     let path = depth * (1.0 + 1.0 / max(V.y, 0.15));
-    let ext = exp(-path * mix(vec3f(0.45, 0.16, 0.12), vec3f(0.35, 0.55, 0.9), tannin));
+    let ext = exp(-path * extK);
     let lit = lt.sun * sunVis * max(lt.L.y, 0.0) + ambient(lt, vec3f(0.0, 1.0, 0.0));
     let body = (bed * ext + deep * (1.0 - ext)) * lit * (1.0 / PI);
     let ripple = xz * (0.45 + wet * 1.4) + vec2f(t * 2.1, -t * 0.6);
     let spark = pow(max(sin(ripple.x * 1.7) * sin(ripple.y * 1.3), 0.0), 12.0);
     glint += lt.sun * sunVis * spark * wet * 0.22;
     col = body * (1.0 - Fr) + refl * Fr + glint;
+    if (ocean) {
+      // a broken line of surf on the waterline, not across the whole shelf
+      let band = 1.0 - smoothstep(0.12, 0.85, depth);
+      let wash = smoothstep(0.05, 0.55, snoise(vec2f(xz.x * 0.08, xz.y * 0.02 - t * 0.4)));
+      let foam = vec3f(0.72, 0.78, 0.8) * (lt.hor * 0.9 + lt.sun * sunVis * 0.1);
+      col = mix(col, foam, band * wash * 0.55);
+    }
   } else {
     // ---- land ----
     let sp = F.forest.y;

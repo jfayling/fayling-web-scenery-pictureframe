@@ -105,6 +105,25 @@ export const SCENES = [
     flight: { agl: 340, speed: 62, pitch: -24, fov: 52 },
     sky: { sunElev: 48, sunAzim: -100, haze: 3.2, clouds: 0.55, cloudAltitude: 1.5, veil: 0.3 },
   },
+  {
+    id: 'coast',
+    name: 'Pacific Coast',
+    place: 'Big Sur, California',
+    seed: 4823,
+    coast: 1,
+    // valleyWidth is how far inland the coastal range reaches full height.
+    // floodplain is the width of a sandy cove; headlands override it with a cliff.
+    relief: 860, ridge: 0.58, featureScale: 6400, gully: 0.72,
+    valleyWidth: 2600, floodplain: 170, river: 0, floor: 8,
+    path: [2600, 1100, 340], pathLen: [26000, 9800, 3600], meander: 0, meanderLen: 1400,
+    density: 0.74, spacing: 8.5, height: 26, conifer: 0.68,
+    autumn: 0.04, treeline: 980, snowline: 4200, clearings: 0.36,
+    rock: 0.9, wetland: 0.0, basin: 0.0, tropical: 0,
+    mist: 0.22, mistTop: 36,
+    water: 0, waterSlope: 0, tannin: 0.0,
+    flight: { agl: 340, speed: 66, pitch: -17, fov: 58, offshore: 360 },
+    sky: { sunElev: 28, sunAzim: -82, haze: 1.5, clouds: 0.18, cloudAltitude: 2.2, veil: 0.1 },
+  },
 ];
 
 export function sceneById(id) {
@@ -137,7 +156,7 @@ export function sceneUniforms(f, scene, visit, mul) {
   f[124] = scene.autumn; f[125] = scene.treeline; f[126] = scene.snowline; f[127] = scene.clearings;
   f[128] = scene.rock; f[129] = scene.wetland; f[130] = scene.basin; f[131] = scene.tropical;
   f[132] = scene.mist * mul.mist; f[133] = scene.mistTop; f[134] = 0; f[135] = seed;
-  f[136] = scene.water; f[137] = scene.waterSlope; f[138] = scene.tannin; f[139] = 0;
+  f[136] = scene.water; f[137] = scene.waterSlope; f[138] = scene.tannin; f[139] = scene.coast ? 1 : 0;
 
   const A = scene.path, M = scene.meander;
   const valleyX = (z) => A[0] * Math.sin(k[0] * z + ph[0]) + A[1] * Math.sin(k[1] * z + ph[1]) + A[2] * Math.sin(k[2] * z + ph[2]);

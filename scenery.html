@@ -268,7 +268,7 @@ struct Frame {
   forest2: vec4f,      // autumn colour, treeline (m above water), snowline (m above water), clearings
   biome:   vec4f,      // rock exposure, wetland, basin depth (lakes), broadleaf style (0 temperate, 1 tropical)
   mist:    vec4f,      // valley mist density, mist top (m above water), -, terrain seed
-  water:   vec4f,      // water level at z = 0 (m), downstream slope, water tint (0 clear, 1 tannin), canopy lod distance (m)
+  water:   vec4f,      // water level at z = 0 (m), downstream slope, water tint (0 clear, 1 tannin), coast (0 inland, 1 shoreline)
 };
 `;
 
@@ -1178,8 +1178,8 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 
 
 // ---- js/wgsl/terrain.js ----
-// Procedural landscape: eroded mountains, a meandering river valley, lake basins, and the
-// vegetation / rock / snow masks that go with them. The height function is baked into
+// Procedural landscape: eroded mountains, a meandering river valley, a one-sided coastline,
+// lake basins, and the vegetation / rock / snow masks that go with them. The height function is baked into
 // camera-centred clipmaps (one 512² layer per level, texel doubling per level) and the
 // renderer samples those instead of re-evaluating the noise per pixel.
 
@@ -1404,11 +1404,62 @@ fn mountainField(xz: vec2f, texel: f32) -> f32 {
   return m;
 }
 
+// Signed metres from the coast path: positive is inland (+x, on the right as the
+// flight runs toward -z), negative is open water.
+fn coastOffset(xz: vec2f) -> f32 {
+  let s = valleyDX(xz.y);
+  return (xz.x - valleyX(xz.y)) * inverseSqrt(1.0 + s * s);
+}
+
+// Shoreline country. The coast path is the waterline. Coves run out as sand; headlands
+// stand up as cliffs. Seaward of the line the bed drops through a shelf into open ocean,
+// with a few stacks where a ridge fails to quite reach shore.
+fn coastHeight(xz: vec2f, texel: f32, m: f32, wl: f32) -> f32 {
+  let z = xz.y;
+  let wig = snoise(vec2f(z * 0.00035, 3.1)) * 260.0
+          + snoise(vec2f(z * 0.0013, 8.4)) * 70.0
+          + snoise(vec2f(z * 0.006, 1.8)) * 16.0;
+  let d = coastOffset(xz) + wig;
+  let cliff = smoothstep(-0.12, 0.38, snoise(vec2f(z * 0.00028, 5.7)));
+  var micro = 0.0;
+  if (texel < 24.0) {
+    micro = snoise(xz * (1.0 / 61.0) + vec2f(3.3, 8.1)) * 1.3;
+    if (texel < 6.0) { micro += snoise(xz * (1.0 / 17.0) + vec2f(9.4, 2.2)) * 0.4; }
+  }
+  if (d < 0.0) {
+    let depth = -d;
+    let near = 1.0 - exp(-depth / 70.0);
+    let shelf = smoothstep(180.0, 2800.0, depth);
+    let abyss = smoothstep(1600.0, 12000.0, depth);
+    var h = wl - 0.35 - near * 5.5 - shelf * 18.0 - abyss * 55.0;
+    if (texel < 24.0 && depth < 500.0) {
+      h += snoise(xz * 0.015 + vec2f(1.0, 4.0)) * 0.4 * (1.0 - shelf);
+    }
+    let stackN = smoothstep(0.58, 0.82, snoise(xz * (1.0 / 420.0) + vec2f(4.2, 1.1)) * 0.5 + 0.5);
+    let stack = smoothstep(0.5, 0.84, m) * stackN * (0.3 + 0.7 * cliff) * (1.0 - smoothstep(40.0, 560.0, depth));
+    let stackH = wl + 5.0 + max(m - 0.35, 0.0) * 80.0;
+    return mix(h, stackH, stack);
+  }
+  let beachW = mix(max(F.valley.y, 30.0), 18.0, cliff);
+  let bluff = mix(5.0, 34.0 + 100.0 * smoothstep(0.22, 0.78, m), cliff);
+  let face = smoothstep(0.0, mix(beachW, 12.0, cliff), d);
+  let terrace = mix(0.35, bluff, face);
+  let reach = max(F.valley.x, beachW + 500.0);
+  let rise = smoothstep(beachW * 0.55, reach, d);
+  let peaks = max(m - 0.04, 0.0) * F.relief.x;
+  var hLand = mix(terrace, max(terrace * 0.22, peaks), rise);
+  if (cliff < 0.5 && texel < 48.0) {
+    hLand += snoise(xz * (1.0 / 95.0) + vec2f(2.0, 6.0)) * 0.7 * (1.0 - rise) * smoothstep(1.2, 3.5, terrace);
+  }
+  return wl + hLand + micro * mix(0.2, 1.0, rise);
+}
+
 // Terrain height in metres.
 fn terrainHeight(xz: vec2f, texel: f32) -> f32 {
   let m = mountainField(xz, texel);
   let z = xz.y;
   let wl = waterLevel(z);
+  if (F.water.w > 0.5) { return coastHeight(xz, texel, m, wl); }
   var shape = 1.0;
   if (F.valley.x > 0.0) {
     let s = valleyDX(z);
@@ -1516,7 +1567,11 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   let alpine = 1.0 - smoothstep(treeline - 160.0, treeline + 30.0, above);
   // forest clings to slopes up to about 50 degrees; ledges break up steeper walls
   let steep = 1.0 - smoothstep(1.15, 1.8, slope + patchy * 0.4);
-  let shore = smoothstep(0.15, 1.0, above + patchy * 0.6);
+  var shore = smoothstep(0.15, 1.0, above + patchy * 0.6);
+  if (F.water.w > 0.5) {
+    // open sand and scrub along the beach; the stand closes up the slope
+    shore = smoothstep(3.5, 22.0, above + patchy * 3.0);
+  }
   // open bog and fen on the flats just above the water
   let bog = F.biome.y * (1.0 - smoothstep(0.5, 6.0, above)) * smoothstep(-0.1, 0.25, fbm2(xz * (1.0 / 140.0), 2));
   // clearings are never bare: scattered regrowth and saplings
@@ -2198,6 +2253,13 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
   let bar = (1.0 - smoothstep(0.1, 0.8, above + n2 * 0.3)) * (1.0 - smoothstep(0.05, 0.3, dens));
   let barC = mix(vec3f(0.16, 0.145, 0.115), vec3f(0.07, 0.065, 0.055), smoothstep(-0.3, 0.3, n1));
   c = mix(c, barC * (0.9 + 0.2 * n2), bar);
+  if (F.water.w > 0.5) {
+    let beach = (1.0 - smoothstep(0.3, 8.0, above)) * (1.0 - smoothstep(0.02, 0.4, dens));
+    var sand = vec3f(0.46, 0.39, 0.26);
+    sand *= 0.78 + 0.32 * n2 + 0.12 * n1;
+    sand *= mix(0.62, 1.0, smoothstep(0.05, 1.4, above));
+    c = mix(c, sand, beach);
+  }
   // rock: granite greys (dark basalt in the tropics), darker in clefts, lighter on ribs
   let strata = snoise(vec2f((xz.x + xz.y) * 0.004, above * 0.09)) * 0.5 + 0.5;
   var rk = mix(vec3f(0.12, 0.115, 0.10), vec3f(0.19, 0.18, 0.16), strata);
@@ -2211,6 +2273,7 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
   let face = fbm2(xz * (1.0 / 420.0) + vec2f(above * 0.0015, 6.3), 3);
   rk *= 0.55 + 0.75 * smoothstep(-0.45, 0.45, face);
   rk *= clamp(1.0 + curv * 5.0, 0.55, 1.25) * (0.85 + 0.3 * n2);
+  if (F.water.w > 0.5) { rk = mix(rk, rk * vec3f(1.25, 0.92, 0.72), 0.55); }
   c = mix(c, rk, rock);
   // lichen and scree tint above the treeline
   c = mix(c, vec3f(0.85, 0.87, 0.9), snow);
@@ -2276,9 +2339,16 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
     }
     let t = F.camPos.w;
     let detail = 1.0 - smoothstep(0.6, 6.0, fp);
-    let r1 = gnoised(xz * (1.0 / 7.0) - flow * t * (1.0 / 7.0) + vec2f(0.0, t * 0.02));
-    let r2 = gnoised(xz * (1.0 / 2.3) - flow * t * (1.3 / 2.3) + vec2f(t * 0.05, 0.0));
-    let sl = r1.yz * 0.021 + r2.yz * 0.018 * detail;
+    let ocean = F.water.w > 0.5;
+    let k1 = select(1.0 / 7.0, 1.0 / 48.0, ocean);
+    let k2 = select(1.0 / 2.3, 1.0 / 13.0, ocean);
+    let r1 = gnoised(xz * k1 - flow * t * k1 + vec2f(0.0, t * select(0.02, 0.006, ocean)));
+    let r2 = gnoised(xz * k2 - flow * t * select(1.3, 0.55, ocean) * k2 + vec2f(t * select(0.05, 0.015, ocean), 0.0));
+    var sl = r1.yz * select(0.021, 0.06, ocean) + r2.yz * select(0.018, 0.026, ocean) * detail;
+    if (ocean) {
+      let swell = gnoised(vec2f(xz.x * 0.0036 + t * 0.01, xz.y * 0.0024 + t * 0.003));
+      sl += swell.yz * 0.1;
+    }
     let n = normalize(vec3f(-sl.x, 1.0, -sl.y));
     // unresolved ripples widen the sun glint with distance
     let rough = 0.05 + 0.10 * smoothstep(0.5, 30.0, fp) + wet * 0.14;
@@ -2290,21 +2360,34 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
     // the wooded banks darken the reflection near the shore
     let bankK = (1.0 - smoothstep(0.2, 3.5, depth)) * smoothstep(0.0, 0.4, 1.0 - R.y);
     let bankCol = standAlbedo(0.5) * (lt.sun * sunVis * 0.25 + ambient(lt, Nt)) * (0.9 / PI);
-    refl = mix(refl, bankCol, bankK * 0.75);
+    refl = mix(refl, bankCol, bankK * select(0.75, 0.12, ocean));
     let Hs = normalize(V + lt.L);
     let NdL = max(dot(n, lt.L), 0.0);
     var glint = lt.sun * sunVis * ggx(max(dot(n, Hs), 0.0), rough) * schlick(dot(V, Hs), 0.02) * NdL / (4.0 * NdV);
     let tannin = F.water.z;
-    let deep = mix(vec3f(0.006, 0.016, 0.016), vec3f(0.016, 0.010, 0.004), tannin);
-    let bed = groundAlbedo(xz, fp, 0.5, 0.0, 0.0, 0.0, 0.0) * mix(vec3f(0.7, 0.85, 0.8), vec3f(0.8, 0.6, 0.35), tannin);
+    var deep = mix(vec3f(0.006, 0.016, 0.016), vec3f(0.016, 0.010, 0.004), tannin);
+    var bed = groundAlbedo(xz, fp, 0.5, 0.0, 0.0, 0.0, 0.0) * mix(vec3f(0.7, 0.85, 0.8), vec3f(0.8, 0.6, 0.35), tannin);
+    var extK = mix(vec3f(0.45, 0.16, 0.12), vec3f(0.35, 0.55, 0.9), tannin);
+    if (ocean) {
+      deep = vec3f(0.004, 0.026, 0.052);
+      bed = vec3f(0.52, 0.44, 0.30) * (0.86 + 0.22 * snoise(xz * 0.03));
+      extK = vec3f(0.15, 0.045, 0.03);
+    }
     let path = depth * (1.0 + 1.0 / max(V.y, 0.15));
-    let ext = exp(-path * mix(vec3f(0.45, 0.16, 0.12), vec3f(0.35, 0.55, 0.9), tannin));
+    let ext = exp(-path * extK);
     let lit = lt.sun * sunVis * max(lt.L.y, 0.0) + ambient(lt, vec3f(0.0, 1.0, 0.0));
     let body = (bed * ext + deep * (1.0 - ext)) * lit * (1.0 / PI);
     let ripple = xz * (0.45 + wet * 1.4) + vec2f(t * 2.1, -t * 0.6);
     let spark = pow(max(sin(ripple.x * 1.7) * sin(ripple.y * 1.3), 0.0), 12.0);
     glint += lt.sun * sunVis * spark * wet * 0.22;
     col = body * (1.0 - Fr) + refl * Fr + glint;
+    if (ocean) {
+      // a broken line of surf on the waterline, not across the whole shelf
+      let band = 1.0 - smoothstep(0.12, 0.85, depth);
+      let wash = smoothstep(0.05, 0.55, snoise(vec2f(xz.x * 0.08, xz.y * 0.02 - t * 0.4)));
+      let foam = vec3f(0.72, 0.78, 0.8) * (lt.hor * 0.9 + lt.sun * sunVis * 0.1);
+      col = mix(col, foam, band * wash * 0.55);
+    }
   } else {
     // ---- land ----
     let sp = F.forest.y;
@@ -2713,6 +2796,25 @@ const SCENES = [
     flight: { agl: 340, speed: 62, pitch: -24, fov: 52 },
     sky: { sunElev: 48, sunAzim: -100, haze: 3.2, clouds: 0.55, cloudAltitude: 1.5, veil: 0.3 },
   },
+  {
+    id: 'coast',
+    name: 'Pacific Coast',
+    place: 'Big Sur, California',
+    seed: 4823,
+    coast: 1,
+    // valleyWidth is how far inland the coastal range reaches full height.
+    // floodplain is the width of a sandy cove; headlands override it with a cliff.
+    relief: 860, ridge: 0.58, featureScale: 6400, gully: 0.72,
+    valleyWidth: 2600, floodplain: 170, river: 0, floor: 8,
+    path: [2600, 1100, 340], pathLen: [26000, 9800, 3600], meander: 0, meanderLen: 1400,
+    density: 0.74, spacing: 8.5, height: 26, conifer: 0.68,
+    autumn: 0.04, treeline: 980, snowline: 4200, clearings: 0.36,
+    rock: 0.9, wetland: 0.0, basin: 0.0, tropical: 0,
+    mist: 0.22, mistTop: 36,
+    water: 0, waterSlope: 0, tannin: 0.0,
+    flight: { agl: 340, speed: 66, pitch: -17, fov: 58, offshore: 360 },
+    sky: { sunElev: 28, sunAzim: -82, haze: 1.5, clouds: 0.18, cloudAltitude: 2.2, veil: 0.1 },
+  },
 ];
 
 function sceneById(id) {
@@ -2745,7 +2847,7 @@ function sceneUniforms(f, scene, visit, mul) {
   f[124] = scene.autumn; f[125] = scene.treeline; f[126] = scene.snowline; f[127] = scene.clearings;
   f[128] = scene.rock; f[129] = scene.wetland; f[130] = scene.basin; f[131] = scene.tropical;
   f[132] = scene.mist * mul.mist; f[133] = scene.mistTop; f[134] = 0; f[135] = seed;
-  f[136] = scene.water; f[137] = scene.waterSlope; f[138] = scene.tannin; f[139] = 0;
+  f[136] = scene.water; f[137] = scene.waterSlope; f[138] = scene.tannin; f[139] = scene.coast ? 1 : 0;
 
   const A = scene.path, M = scene.meander;
   const valleyX = (z) => A[0] * Math.sin(k[0] * z + ph[0]) + A[1] * Math.sin(k[1] * z + ph[1]) + A[2] * Math.sin(k[2] * z + ph[2]);
@@ -4317,8 +4419,15 @@ async function main() {
 
   function flightLineX(z) {
     const s = tour.scene;
+    const phase = z * (Math.PI * 2 / 7300) + path.seed * 0.37;
+    if (s.coast) {
+      // Stay just offshore of the waterline so the frame splits: open ocean to one
+      // side, the coast to the other. A slow sway closes in on the headlands.
+      const sway = 170 * Math.sin(z * (Math.PI * 2 / 15000) + path.seed * 0.37);
+      return path.valleyX(z) - (s.flight.offshore ?? 360) + sway;
+    }
     // a slow sway across the valley keeps one wall, then the other, in the picture
-    const sway = (s.floodplain + s.valleyWidth * 0.25) * 0.35 * Math.sin(z * (Math.PI * 2 / 7300) + path.seed * 0.37);
+    const sway = (s.floodplain + s.valleyWidth * 0.25) * 0.35 * Math.sin(phase);
     return path.valleyX(z) + sway;
   }
   function flightTargetYaw() {

@@ -643,8 +643,15 @@ async function main() {
 
   function flightLineX(z) {
     const s = tour.scene;
+    const phase = z * (Math.PI * 2 / 7300) + path.seed * 0.37;
+    if (s.coast) {
+      // Stay just offshore of the waterline so the frame splits: open ocean to one
+      // side, the coast to the other. A slow sway closes in on the headlands.
+      const sway = 170 * Math.sin(z * (Math.PI * 2 / 15000) + path.seed * 0.37);
+      return path.valleyX(z) - (s.flight.offshore ?? 360) + sway;
+    }
     // a slow sway across the valley keeps one wall, then the other, in the picture
-    const sway = (s.floodplain + s.valleyWidth * 0.25) * 0.35 * Math.sin(z * (Math.PI * 2 / 7300) + path.seed * 0.37);
+    const sway = (s.floodplain + s.valleyWidth * 0.25) * 0.35 * Math.sin(phase);
     return path.valleyX(z) + sway;
   }
   function flightTargetYaw() {

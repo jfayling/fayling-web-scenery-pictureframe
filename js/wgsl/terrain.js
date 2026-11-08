@@ -1,5 +1,5 @@
-// Procedural landscape: eroded mountains, a meandering river valley, lake basins, and the
-// vegetation / rock / snow masks that go with them. The height function is baked into
+// Procedural landscape: eroded mountains, a meandering river valley, a one-sided coastline,
+// lake basins, and the vegetation / rock / snow masks that go with them. The height function is baked into
 // camera-centred clipmaps (one 512² layer per level, texel doubling per level) and the
 // renderer samples those instead of re-evaluating the noise per pixel.
 import { FRAME_WGSL, NOISE_WGSL, CLIP_RES, CLIP_LEVELS, CLIP_TEXEL0, PROBE_N } from './common.js';
@@ -225,11 +225,62 @@ fn mountainField(xz: vec2f, texel: f32) -> f32 {
   return m;
 }
 
+// Signed metres from the coast path: positive is inland (+x, on the right as the
+// flight runs toward -z), negative is open water.
+fn coastOffset(xz: vec2f) -> f32 {
+  let s = valleyDX(xz.y);
+  return (xz.x - valleyX(xz.y)) * inverseSqrt(1.0 + s * s);
+}
+
+// Shoreline country. The coast path is the waterline. Coves run out as sand; headlands
+// stand up as cliffs. Seaward of the line the bed drops through a shelf into open ocean,
+// with a few stacks where a ridge fails to quite reach shore.
+fn coastHeight(xz: vec2f, texel: f32, m: f32, wl: f32) -> f32 {
+  let z = xz.y;
+  let wig = snoise(vec2f(z * 0.00035, 3.1)) * 260.0
+          + snoise(vec2f(z * 0.0013, 8.4)) * 70.0
+          + snoise(vec2f(z * 0.006, 1.8)) * 16.0;
+  let d = coastOffset(xz) + wig;
+  let cliff = smoothstep(-0.12, 0.38, snoise(vec2f(z * 0.00028, 5.7)));
+  var micro = 0.0;
+  if (texel < 24.0) {
+    micro = snoise(xz * (1.0 / 61.0) + vec2f(3.3, 8.1)) * 1.3;
+    if (texel < 6.0) { micro += snoise(xz * (1.0 / 17.0) + vec2f(9.4, 2.2)) * 0.4; }
+  }
+  if (d < 0.0) {
+    let depth = -d;
+    let near = 1.0 - exp(-depth / 70.0);
+    let shelf = smoothstep(180.0, 2800.0, depth);
+    let abyss = smoothstep(1600.0, 12000.0, depth);
+    var h = wl - 0.35 - near * 5.5 - shelf * 18.0 - abyss * 55.0;
+    if (texel < 24.0 && depth < 500.0) {
+      h += snoise(xz * 0.015 + vec2f(1.0, 4.0)) * 0.4 * (1.0 - shelf);
+    }
+    let stackN = smoothstep(0.58, 0.82, snoise(xz * (1.0 / 420.0) + vec2f(4.2, 1.1)) * 0.5 + 0.5);
+    let stack = smoothstep(0.5, 0.84, m) * stackN * (0.3 + 0.7 * cliff) * (1.0 - smoothstep(40.0, 560.0, depth));
+    let stackH = wl + 5.0 + max(m - 0.35, 0.0) * 80.0;
+    return mix(h, stackH, stack);
+  }
+  let beachW = mix(max(F.valley.y, 30.0), 18.0, cliff);
+  let bluff = mix(5.0, 34.0 + 100.0 * smoothstep(0.22, 0.78, m), cliff);
+  let face = smoothstep(0.0, mix(beachW, 12.0, cliff), d);
+  let terrace = mix(0.35, bluff, face);
+  let reach = max(F.valley.x, beachW + 500.0);
+  let rise = smoothstep(beachW * 0.55, reach, d);
+  let peaks = max(m - 0.04, 0.0) * F.relief.x;
+  var hLand = mix(terrace, max(terrace * 0.22, peaks), rise);
+  if (cliff < 0.5 && texel < 48.0) {
+    hLand += snoise(xz * (1.0 / 95.0) + vec2f(2.0, 6.0)) * 0.7 * (1.0 - rise) * smoothstep(1.2, 3.5, terrace);
+  }
+  return wl + hLand + micro * mix(0.2, 1.0, rise);
+}
+
 // Terrain height in metres.
 fn terrainHeight(xz: vec2f, texel: f32) -> f32 {
   let m = mountainField(xz, texel);
   let z = xz.y;
   let wl = waterLevel(z);
+  if (F.water.w > 0.5) { return coastHeight(xz, texel, m, wl); }
   var shape = 1.0;
   if (F.valley.x > 0.0) {
     let s = valleyDX(z);
@@ -337,7 +388,11 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   let alpine = 1.0 - smoothstep(treeline - 160.0, treeline + 30.0, above);
   // forest clings to slopes up to about 50 degrees; ledges break up steeper walls
   let steep = 1.0 - smoothstep(1.15, 1.8, slope + patchy * 0.4);
-  let shore = smoothstep(0.15, 1.0, above + patchy * 0.6);
+  var shore = smoothstep(0.15, 1.0, above + patchy * 0.6);
+  if (F.water.w > 0.5) {
+    // open sand and scrub along the beach; the stand closes up the slope
+    shore = smoothstep(3.5, 22.0, above + patchy * 3.0);
+  }
   // open bog and fen on the flats just above the water
   let bog = F.biome.y * (1.0 - smoothstep(0.5, 6.0, above)) * smoothstep(-0.1, 0.25, fbm2(xz * (1.0 / 140.0), 2));
   // clearings are never bare: scattered regrowth and saplings
