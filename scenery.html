@@ -4031,6 +4031,35 @@ async function main() {
   for (let i = 0; i < BLOOM_LEVELS * 2; i++) bloomUBOs.push(mkBuf(16, GU.UNIFORM | GU.COPY_DST, 'bloom ubo'));
 
   let W = 0, H = 0;
+  // A frame that runs past one refresh is shown twice, so the flight appears to stutter.
+  // paceScale eases the drawing resolution down just enough to fit, then back up when the
+  // GPU has room. It never goes above the Render scale setting.
+  let paceScale = 1;
+  let paceHold = 0;
+  let paceSeen = 0;
+  let paceFresh = 0;
+  function considerPace(dt) {
+    if (!hasTS || gpuMs <= 0 || shotName) return;
+    // The first frames bake every terrain level at once, so the early GPU time is not
+    // the time the flight will actually run at.
+    paceSeen += dt;
+    if (paceSeen < 2.5) return;
+    paceHold += dt;
+    if (paceHold < 1.2) return;
+    paceHold = 0;
+    let next = paceScale;
+    if (gpuMs > 15.5) next = paceScale * Math.sqrt(14.5 / gpuMs);
+    else if (gpuMs < 12 && paceScale < 1) next = Math.min(1, paceScale * Math.sqrt(13 / gpuMs));
+    next = Math.max(paceScale - 0.15, Math.min(paceScale + 0.1, next));
+    next = Math.max(0.6, Math.min(1, Math.round(next * 20) / 20));
+    if (next === paceScale) return;
+    paceScale = next;
+    // The running average was measured at the old resolution. Ignore it, and the
+    // resize frame, before deciding whether another step is needed.
+    gpuMs = 0;
+    paceFresh = 3;
+    W = 0;
+  }
   let colorMS, depthMS, hdrTex, bloomTex;
   const mainPass = {
     colorAttachments: [{ view: null, resolveTarget: null, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'discard' }],
@@ -4044,7 +4073,7 @@ async function main() {
 
   function resize() {
     const fw = Number(qs.get('w')) || 0, fh = Number(qs.get('h')) || 0;
-    const dpr = (window.devicePixelRatio || 1) * P.renderScale;
+    const dpr = (window.devicePixelRatio || 1) * P.renderScale * paceScale;
     const w = fw || Math.max(1, Math.round(canvas.clientWidth * dpr));
     const h = fh || Math.max(1, Math.round(canvas.clientHeight * dpr));
     if (w === W && h === H) return;
@@ -4099,7 +4128,8 @@ async function main() {
   const onTsMapped = () => {
     const t = new BigUint64Array(tsRead.getMappedRange());
     const ms = Number(t[1] - t[0]) / 1e6;
-    if (ms > 0 && ms < 1000) gpuMs = gpuMs ? gpuMs * 0.8 + ms * 0.2 : ms;
+    if (paceFresh > 0) paceFresh--;
+    else if (ms > 0 && ms < 1000) gpuMs = gpuMs ? gpuMs * 0.8 + ms * 0.2 : ms;
     tsRead.unmap();
     tsPending = false;
   };
@@ -4459,7 +4489,8 @@ async function main() {
   // --------------------------------------------------------------------------------------
   function encodeClips(cp) {
     const fx = Math.sin(cam.yaw), fz = -Math.cos(cam.yaw);
-    let budget = 3;
+    // One level per frame. Rebaking several 512² maps in the same frame is a visible hitch.
+    let budget = 1;
     for (let l = 0; l < CLIP_LEVELS; l++) {
       const t = clipTexel(l);
       const span = t * CLIP_RES;
@@ -4560,6 +4591,7 @@ async function main() {
   // --------------------------------------------------------------------------------------
   // Per-frame uniforms
   // --------------------------------------------------------------------------------------
+  let skyViewStamp = '';
   let simTime = Number(qs.get('t')) || 0;
   let frameIndex = 0;
   let skyLocation = null;
@@ -6665,9 +6697,18 @@ async function main() {
       cp.dispatchWorkgroups(1);
       doProbe = true;
     }
-    cp.setPipeline(skyViewPipe);
-    cp.setBindGroup(0, bgSkyView);
-    cp.dispatchWorkgroups(Math.ceil(SKY_W / 8), Math.ceil(SKY_H / 8));
+    // The sky-view LUT depends on the sun, the haze and the camera altitude, not on the
+    // view direction. Rebuilding it every frame costs the same on a still afternoon as
+    // during a time lapse, so it is refreshed only when one of those changes.
+    const skySun = (skyUsesPlace() && liveSky) ? liveSky.sunDirection : horizonDirection(manualSunElev(), P.sunAzim);
+    const skyStamp = P.haze.toFixed(2) + '|' + (Math.max(cam.y, 10) * 0.001).toFixed(2) + '|' +
+      skySun[0].toFixed(3) + '|' + skySun[1].toFixed(3) + '|' + skySun[2].toFixed(3);
+    if (skyStamp !== skyViewStamp) {
+      skyViewStamp = skyStamp;
+      cp.setPipeline(skyViewPipe);
+      cp.setBindGroup(0, bgSkyView);
+      cp.dispatchWorkgroups(Math.ceil(SKY_W / 8), Math.ceil(SKY_H / 8));
+    }
     cp.setPipeline(apPipe);
     cp.setBindGroup(0, bgAP);
     cp.dispatchWorkgroups(Math.ceil(AP_RES / 8), Math.ceil(AP_RES / 8));
@@ -6741,6 +6782,7 @@ async function main() {
     if (doProbe) { probePending = true; probeRead.mapAsync(GPUMapMode.READ).then(onProbe, onProbeFail); }
     if (doTs) { tsPending = true; tsRead.mapAsync(GPUMapMode.READ).then(onTsMapped, onTsFail); }
     if (readBuf) saveShot(readBuf, Math.ceil(W * 4 / 256) * 256);
+    considerPace(dt);
   }
 
   async function saveShot(buf, bpr) {
