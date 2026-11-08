@@ -69,7 +69,7 @@ struct VSOut {
 fn meshCanopy(xz: vec2f, dens: f32, eff: f32) -> f32 {
   let sp = F.forest.y;
   let mean = dens * F.forest.z * 0.62;
-  let kNear = 1.0 - smoothstep(0.3 * sp, 0.55 * sp, eff);
+  let kNear = 1.0 - smoothstep(0.35 * sp, 0.8 * sp, eff);
   if (kNear <= 0.0) { return mean; }
   let c = canopyAt(xz, true, 0.0, 0.0);
   return mix(mean, max(c.y, understoryH(dens)), kNear);
@@ -288,7 +288,7 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
   } else {
     // ---- land ----
     let sp = F.forest.y;
-    let farK = smoothstep(0.3 * sp, 0.85 * sp, fp);
+    let farK = smoothstep(0.4 * sp, 1.15 * sp, fp);
     let gAlb = groundAlbedo(xz, fp, above, dens, M.z, M.w, curv);
     // bumpy ground normal near the camera
     var Ng = Nt;
@@ -298,9 +298,13 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
     }
     // valleys and hollows collect less sky light
     let aoT = clamp(1.0 + curv * 4.0, 0.6, 1.0);
+    var crown: Canopy;
+    crown.hit = false;
+    let wantCrown = F.forest.x > 0.0 && dens > 0.02 && farK < 1.0;
+    if (wantCrown) { crown = canopyAt(xz, true, 0.0, 0.0); }
     var nearC = vec3f(0.0);
     if (farK < 1.0 && F.forest.x > 0.0) {
-      let c = canopyAt(xz, true, 0.0, 0.0);
+      let c = crown;
       let uy = understoryH(dens);
       if (c.hit && c.y > uy) {
         let t = c.tree;
@@ -361,7 +365,32 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
                 + lt.moon * max(dot(standN, lt.M), 0.0) + ambient(lt, standN) * 0.7 * aoT);
       let gapLit = mix(1.0, lit * 0.35, closure);
       let floorC = gAlb * (direct(lt, Nt, sunVis * gapLit) + ambient(lt, Nt) * mix(1.0, 0.3, closure) * aoT);
-      farCol = mix(floorC, stand, closure);
+      let stat = mix(floorC, stand, closure);
+      farCol = stat;
+      // An open stand's average is mostly snow, so the trees vanish in a hard line
+      // once the cones are no longer shaded. Keep a clump per few pixels, the same
+      // density, out to the horizon. Closed canopies already read as forest.
+      let crownR = sp * mix(0.95, 0.48, conif);
+      let area = min(1.0, dens * 3.14159 * crownR * crownR / (sp * sp));
+      let dotK = 1.0 - smoothstep(0.72, 0.95, area);
+      if (dotK > 0.0 && dens > 0.02) {
+        let clump = max(sp, fp * 1.7);
+        let ip = vec2i(floor(xz / clump));
+        let h0 = pcgHash((u32(ip.x) * 73856093u) ^ (u32(ip.y) * 19349663u + seedU()));
+        let h1 = pcgHash(h0 ^ 0x68e31da4u);
+        let j = vec2f(unit16(h0), unit16(h0 >> 16u)) - 0.5;
+        let pos = (vec2f(ip) + 0.5 + j * 0.5) * clump;
+        var cov = 0.0;
+        if (unit16(h1) < dens) {
+          let rad = clump * 0.4;
+          let aa = max(fp * 0.35, clump * 0.05);
+          cov = 1.0 - smoothstep(rad - aa, rad + aa, length(xz - pos));
+        }
+        let treeLit = standAlbedo(conif) * (lt.sun * sunVis * lit * crownCos * 0.9
+                    + lt.moon * max(dot(standN, lt.M), 0.0) + ambient(lt, standN) * 0.55 * aoT);
+        let openFloor = gAlb * (direct(lt, Nt, sunVis) + ambient(lt, Nt) * aoT);
+        farCol = mix(stat, mix(openFloor, treeLit, cov), dotK);
+      }
     }
     col = select(mix(nearC, farCol, farK), farCol, F.forest.x <= 0.0) * (1.0 / PI);
     // A water film darkens foliage and rock and lifts the leaf sheen.

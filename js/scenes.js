@@ -71,6 +71,25 @@ export const SCENES = [
     sky: { sunElev: 36, sunAzim: 118, haze: 1.0, clouds: 0.2, cloudAltitude: 3.6, veil: 0.18 },
   },
   {
+    id: 'rockies',
+    name: 'Colorado Rockies',
+    place: 'Front Range, Colorado',
+    seed: 6409,
+    // Snowline sits below the valley floor, so the ground is covered along with the
+    // mountains. Steeper ribs still break through as rock. The forest stays open
+    // enough that the snow shows between the spruce.
+    relief: 2000, ridge: 0.74, featureScale: 9000, gully: 1.15,
+    valleyWidth: 4800, floodplain: 420, river: 9, floor: 2.4,
+    path: [1300, 500, 170], pathLen: [14000, 6000, 2500], meander: 80, meanderLen: 1400,
+    density: 0.42, spacing: 11.0, height: 22, conifer: 0.95,
+    autumn: 0.0, treeline: 340, snowline: -260, clearings: 0.42,
+    rock: 1.0, wetland: 0.02, basin: 0.0, tropical: 0,
+    mist: 0.08, mistTop: 28,
+    water: 2300, waterSlope: 0.006, tannin: 0.0,
+    flight: { agl: 520, speed: 72, pitch: -16, fov: 54 },
+    sky: { sunElev: 38, sunAzim: 48, haze: 0.7, clouds: 0.12, cloudAltitude: 5.6, veil: 0.06 },
+  },
+  {
     id: 'tropical',
     name: 'Tropical Rainforest',
     place: 'Highlands of Borneo',
