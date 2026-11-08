@@ -46,8 +46,9 @@ Settings → **Scenery** chooses between the tour (in order or shuffled) and a s
 | Input | Action |
 |---|---|
 | P | Autopilot or free flight |
+| L | Dynamic look (returns to the flight view) or static look (holds the angle) |
 | [ and ] | Previous or next region |
-| Hold left mouse button and drag | Look around (the autopilot eases back afterwards) |
+| Hold left mouse button and drag | Look around. Dynamic look eases back to the flight view; static look stays where you leave it |
 | Left and right mouse buttons together | Reset the view |
 | W A S D | Move (free flight) |
 | Space or E / Q or C | Up / down (free flight) |
@@ -59,7 +60,7 @@ Settings → **Scenery** chooses between the tour (in order or shuffled) and a s
 | F1 or the Settings button | Open the settings panel |
 | Esc, H, or the × button | Close the settings panel |
 
-The autopilot follows the valley and keeps a safe height over the terrain ahead, using heights read back from the GPU. `ui=0` in the URL hides the HUD and buttons for that visit.
+The autopilot follows the valley and keeps a safe height over the terrain ahead, using heights read back from the GPU. **Look behavior**, under Scenery → Flight, chooses whether a dragged view returns to that framing or stays where you aim it. Left and right click together still resets the view. `ui=0` in the URL hides the HUD and buttons for that visit.
 
 ## Settings
 

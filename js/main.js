@@ -32,6 +32,7 @@ export const P = {
   sceneLabel: true,
   sceneSky: true,
   autopilot: true,
+  lookMode: 'dynamic',
   flightSpeed: 1,
   flightAltitude: 1,
   cameraTilt: 0,
@@ -719,6 +720,7 @@ async function main() {
     if (e.code === 'KeyF') toggleShown('weather');
     if (e.code === 'KeyR') toggleShown('rain');
     if (e.code === 'KeyP') toggleShown('autopilot');
+    if (e.code === 'KeyL' && uiReady) commitSetting('lookMode', P.lookMode === 'static' ? 'dynamic' : 'static');
     if (e.code === 'BracketRight') requestScene(nextTourIndex(1));
     if (e.code === 'BracketLeft') requestScene(P.sceneMode === 'tour' ? nextTourIndex(-1) : tour.idx);
   });
@@ -814,7 +816,8 @@ async function main() {
       const floor = groundUnder + flightAgl() * 0.35;
       if (flight.y < floor) { flight.y = floor; flight.vy = Math.max(flight.vy, 0); }
     }
-    if (!looking) {
+    // Dynamic look eases a dragged view back to the flight framing. Static look keeps the angle.
+    if (!looking && P.lookMode !== 'static') {
       const ease = Math.exp(-dt / 3.5);
       flight.lookYaw *= ease;
       flight.lookPitch *= ease;
@@ -1348,12 +1351,22 @@ async function main() {
     autopilotBtn.setAttribute('aria-pressed', String(P.autopilot));
     autopilotBtn.textContent = P.autopilot ? 'Autopilot' : 'Free flight';
   }
+  const lookBtn = document.getElementById('look-mode');
+  lookBtn.addEventListener('click', (event) => {
+    event.stopPropagation();
+    commitSetting('lookMode', P.lookMode === 'static' ? 'dynamic' : 'static');
+  });
+  function applyLookButton() {
+    const held = P.lookMode === 'static';
+    lookBtn.setAttribute('aria-pressed', String(!held));
+    lookBtn.textContent = held ? 'Static look' : 'Dynamic look';
+  }
   const panelBody = document.getElementById('panel-body');
   const BOOL_KEYS = new Set(['showButtons', 'showInfo', 'clock', 'clock24h', 'clockSeconds', 'clockDate',
     'weather', 'weatherTemp', 'weatherFeels', 'weatherPrecip', 'weatherHumidity', 'weatherWind', 'weatherForecast', 'weatherAlerts',
     'sceneLabel', 'sceneSky', 'autopilot', 'moon', 'stars', 'cloudMotion', 'rain', 'rainFollow']);
   const STRING_KEYS = new Set(['clockStyle', 'clockColor', 'clockPosition', 'weatherZip', 'weatherUnit', 'weatherPosition',
-    'sceneMode', 'scene', 'tourOrder',
+    'sceneMode', 'scene', 'tourOrder', 'lookMode',
     'skyMode', 'zipCode', 'skyWhen', 'skyLapseStart', 'cloudMode', 'starMode', 'rainMode', 'rainStyle']);
   const SUN_DRIVEN = ['sunElev', 'sunAzim'];
   const CLOUD_DRIVEN = [
@@ -1411,6 +1424,10 @@ async function main() {
       ] },
       { title: 'Flight', settings: [
         ['autopilot', 'Autopilot', 'toggle', 'On', 'Off'],
+        ['lookMode', 'Look behavior', 'select', [
+          ['dynamic', 'Dynamic / return'],
+          ['static', 'Static / hold'],
+        ]],
         ['flightSpeed', 'Speed', 0.25, 3, 0.05, 'flight'],
         ['flightAltitude', 'Altitude', 0.4, 3, 0.01, 'flight'],
         ['cameraTilt', 'Camera tilt (deg)', -40, 25, 0.5, 'flight'],
@@ -1940,6 +1957,7 @@ async function main() {
       ['Esc', 'Close settings'],
       ['H', 'Show or hide settings'],
       ['P', 'Autopilot or free flight'],
+      ['L', 'Dynamic or static look'],
       ['[ ]', 'Previous or next scene'],
       ['T', 'Show or hide the clock'],
       ['F', 'Show or hide the weather'],
@@ -2767,6 +2785,7 @@ async function main() {
         updateRainClouds();
       }
       if (key === 'starMode') applyStarMode();
+      if (key === 'lookMode') applyLookButton();
       if (key === 'sceneMode') {
         applySceneControls();
         if (value === 'single' && tour.scene.id !== P.scene) requestScene(sceneIndex(P.scene));
@@ -2909,6 +2928,7 @@ async function main() {
   applyShowInfo();
   applyClock();
   applyAutopilotButton();
+  applyLookButton();
   applySceneControls();
   applyCloudMode();
   applyStarMode();

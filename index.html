@@ -19,7 +19,7 @@
                     opacity: .38; transition: opacity .15s ease, background .15s ease; }
   #toolbar button:hover, #toolbar button:focus-visible { opacity: 1; background: #18222ce6; }
   #toolbar button:focus-visible { outline: 2px solid #e2a04e; outline-offset: 2px; }
-  #settings[aria-expanded="true"], #autopilot[aria-pressed="false"] { border-color: #e2a04eaa; }
+  #settings[aria-expanded="true"], #autopilot[aria-pressed="false"], #look-mode[aria-pressed="false"] { border-color: #e2a04eaa; }
   #scene-label { position: fixed; z-index: 1; left: 50%; bottom: 9vh; transform: translateX(-50%);
                  color: #f7f4ee; font: 300 30px/1.2 system-ui, sans-serif; letter-spacing: .14em; text-transform: uppercase;
                  text-align: center; white-space: nowrap; text-shadow: 0 1px 3px #000c, 0 0 18px #0008;
@@ -199,11 +199,12 @@
 <div id="hud">
   <div id="sky-readout" hidden></div>
   <div id="fps">starting…</div>
-  <div class="help">left drag: look · left+right: reset view · P autopilot / free flight · WASD move · Space/E up · Q/C down · wheel altitude · Shift fast · [ ] scene · F1 settings · H panel · T clock · F weather</div>
+  <div class="help">left drag: look · L dynamic / static look · left+right: reset view · P autopilot / free flight · WASD move · Space/E up · Q/C down · wheel altitude · Shift fast · [ ] scene · F1 settings · H panel · T clock · F weather</div>
 </div>
 <div id="toolbar">
   <button id="next-scene" type="button" title="Fly to the next scene (])">Next scene</button>
   <button id="autopilot" type="button" aria-pressed="true" title="Autopilot or free flight (P)">Autopilot</button>
+  <button id="look-mode" type="button" aria-pressed="true" title="Dynamic look returns to the flight view. Static look holds the angle (L)">Dynamic look</button>
   <button id="settings" type="button" aria-expanded="false" title="Show settings (F1)">Settings</button>
 </div>
 <time id="clock-widget" aria-label="Current time">
