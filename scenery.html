@@ -2088,7 +2088,7 @@ struct VSOut {
 fn meshCanopy(xz: vec2f, dens: f32, eff: f32) -> f32 {
   let sp = F.forest.y;
   let mean = dens * F.forest.z * 0.62;
-  let kNear = 1.0 - smoothstep(0.35 * sp, 0.8 * sp, eff);
+  let kNear = 1.0 - smoothstep(0.55 * sp, 1.15 * sp, eff);
   if (kNear <= 0.0) { return mean; }
   let c = canopyAt(xz, true, 0.0, 0.0);
   return mix(mean, max(c.y, understoryH(dens)), kNear);
@@ -2386,24 +2386,26 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
       let floorC = gAlb * (direct(lt, Nt, sunVis * gapLit) + ambient(lt, Nt) * mix(1.0, 0.3, closure) * aoT);
       let stat = mix(floorC, stand, closure);
       farCol = stat;
-      // An open stand's average is mostly snow, so the trees vanish in a hard line
-      // once the cones are no longer shaded. Keep a clump per few pixels, the same
-      // density, out to the horizon. Closed canopies already read as forest.
+      // Open stands (snow, clearings) need the real trees, not a coarser stand-in.
+      // A clump grid splits as the camera advances, so new crowns appear in the gaps.
+      // Each distant mark is the tree that already occupies that cell.
       let crownR = sp * mix(0.95, 0.48, conif);
       let area = min(1.0, dens * 3.14159 * crownR * crownR / (sp * sp));
       let dotK = 1.0 - smoothstep(0.72, 0.95, area);
       if (dotK > 0.0 && dens > 0.02) {
-        let clump = max(sp, fp * 1.7);
-        let ip = vec2i(floor(xz / clump));
-        let h0 = pcgHash((u32(ip.x) * 73856093u) ^ (u32(ip.y) * 19349663u + seedU()));
-        let h1 = pcgHash(h0 ^ 0x68e31da4u);
-        let j = vec2f(unit16(h0), unit16(h0 >> 16u)) - 0.5;
-        let pos = (vec2f(ip) + 0.5 + j * 0.5) * clump;
+        let t = treeCell(vec2i(floor(xz / sp)), true, dens, conif);
         var cov = 0.0;
-        if (unit16(h1) < dens) {
-          let rad = clump * 0.4;
-          let aa = max(fp * 0.35, clump * 0.05);
-          cov = 1.0 - smoothstep(rad - aa, rad + aa, length(xz - pos));
+        if (t.ok) {
+          let rad = max(t.r, 0.5);
+          let d = length(xz - t.pos);
+          let aa = max(fp * 0.55, rad * 0.08);
+          let geom = 1.0 - smoothstep(rad - aa, rad + aa, d);
+          // While the crown is smaller than a pixel, tint its whole cell by the
+          // crown's area. The tree is already there; it only sharpens as it grows
+          // on screen. An empty cell stays snow, so nothing has to pop in later.
+          let cellCov = min(0.9, 3.14159 * rad * rad / (sp * sp));
+          let spread = smoothstep(0.4, 1.35, fp / rad);
+          cov = mix(geom, cellCov, spread);
         }
         let treeLit = standAlbedo(conif) * (lt.sun * sunVis * lit * crownCos * 0.9
                     + lt.moon * max(dot(standN, lt.M), 0.0) + ambient(lt, standN) * 0.55 * aoT);
