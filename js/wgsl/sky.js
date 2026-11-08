@@ -712,7 +712,7 @@ fn skyRadiance(dirIn: vec3f, withSun: bool, pixAng: f32) -> vec3f {
   L = L * (1.0 - cl.a) + cl.rgb;
   L += nightSky(dir, pixAng, cl.a, false);
   if (withSun) { L += sunDisk(dir) * sunT; }
-  return L;
+  return applyRainSky(dir, L);
 }
 
 // Sunlight that reaches a ground point through both cloud decks. The layer is sampled

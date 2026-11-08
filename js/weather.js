@@ -22,13 +22,15 @@ function condition(code) {
   return ['Current conditions', 'cloud'];
 }
 
-// Open-Meteo uses WMO weather codes. Each raining code maps to one static rain setup:
-// intensity, drop size on the surface, and lightning. Snow and dry codes stay off.
+// Open-Meteo uses WMO weather codes. Each wet code maps to one rain, storm, or snow setup.
 function rainLook(intensity, ripples, splashes, lightning = 0, style = 'rain') {
   return { rain: true, intensity, style, lightning, ripples, splashes };
 }
 function dryRain() {
   return { rain: false, intensity: 0, style: 'rain', lightning: 0, ripples: 0, splashes: 0 };
+}
+function snowLook(intensity) {
+  return { rain: true, intensity, style: 'snow', lightning: 0, ripples: 0, splashes: 0 };
 }
 const RAIN_BY_CODE = {
   51: rainLook(0.10, 0.45, 0.22), // light drizzle
@@ -44,11 +46,17 @@ const RAIN_BY_CODE = {
   80: rainLook(0.36, 1.15, 1.05), // slight rain showers
   81: rainLook(0.58, 1.4, 1.3, 0.1), // moderate rain showers
   82: rainLook(0.9, 1.75, 1.7, 0.28), // violent rain showers
+  71: snowLook(0.22), // slight snow
+  73: snowLook(0.48), // moderate snow
+  75: snowLook(0.78), // heavy snow
+  77: snowLook(0.16), // snow grains
+  85: snowLook(0.34), // slight snow showers
+  86: snowLook(0.72), // heavy snow showers
   95: rainLook(0.7, 1.5, 1.45, 0.65, 'thunderstorm'),
   96: rainLook(0.84, 1.7, 1.65, 0.82, 'thunderstorm'), // thunderstorm, slight hail
   99: rainLook(0.97, 1.9, 1.85, 0.95, 'thunderstorm'), // thunderstorm, heavy hail
 };
-const DRY_WEATHER_CODES = new Set([0, 1, 2, 3, 45, 48, 71, 73, 75, 77, 85, 86]);
+const DRY_WEATHER_CODES = new Set([0, 1, 2, 3, 45, 48]);
 
 function rainLookFromAmount(amount, metric) {
   const mm = metric ? amount : amount * 25.4;

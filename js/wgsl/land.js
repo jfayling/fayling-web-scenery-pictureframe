@@ -3,6 +3,7 @@ import { FRAME_WGSL, ATMO_CORE_WGSL, AP_RES, AP_MAX_KM } from './common.js';
 import { SKY_RENDER_FUNCS, SKY_CLOUD_FUNCS } from './sky.js';
 import { TERRAIN_FUNCS, clipSampleWGSL } from './terrain.js';
 import { FOREST_FUNCS } from './forest.js';
+import { RAIN_STRUCT, RAIN_FUNCS } from './rain.js';
 
 const RENDER_BINDINGS = /* wgsl */ `
 @group(0) @binding(0) var<uniform> F: Frame;
@@ -14,7 +15,9 @@ const RENDER_BINDINGS = /* wgsl */ `
 
 // Full-resolution sky + clouds. Cloud silhouettes are anti-aliased analytically: the
 // screen-space derivative of each layer's edge function sets the width of its opacity edge.
-export const SKY_BG = FRAME_WGSL + ATMO_CORE_WGSL + RENDER_BINDINGS + SKY_RENDER_FUNCS + SKY_CLOUD_FUNCS + /* wgsl */ `
+export const SKY_BG = FRAME_WGSL + ATMO_CORE_WGSL + RENDER_BINDINGS + RAIN_STRUCT + /* wgsl */ `
+@group(0) @binding(5) var<uniform> Rain: RainU;
+` + SKY_RENDER_FUNCS + SKY_CLOUD_FUNCS + RAIN_FUNCS + /* wgsl */ `
 struct VO { @builtin(position) pos: vec4f, @location(0) ndc: vec2f };
 @vertex fn vs(@builtin(vertex_index) i: u32) -> VO {
   let p = vec2f(f32((i << 1u) & 2u), f32(i & 2u)) * 2.0 - 1.0;
@@ -38,7 +41,7 @@ struct VO { @builtin(position) pos: vec4f, @location(0) ndc: vec2f };
   var sunT = 1.0;
   let cl = cloudLayers(d2, pixAng, aa, &sunT);
   let L = skyAtmo(d2) * (1.0 - cl.a) + nightSky(d2, pixAng, cl.a, true) + cl.rgb + sunDisk(dir) * sunT;
-  return vec4f(L, 1.0);
+  return vec4f(applyRainSky(d2, L), 1.0);
 }
 `;
 
@@ -48,7 +51,9 @@ export function landWGSL(filterA) {
 @group(0) @binding(6) var clipA: texture_2d_array<f32>;
 @group(0) @binding(7) var clipB: texture_2d_array<f32>;
 @group(0) @binding(8) var<uniform> CL: ClipLevels;
-` + SKY_RENDER_FUNCS + SKY_CLOUD_FUNCS + TERRAIN_FUNCS + clipSampleWGSL(filterA) + FOREST_FUNCS + /* wgsl */ `
+` + RAIN_STRUCT + /* wgsl */ `
+@group(0) @binding(9) var<uniform> Rain: RainU;
+` + SKY_RENDER_FUNCS + SKY_CLOUD_FUNCS + RAIN_FUNCS + TERRAIN_FUNCS + clipSampleWGSL(filterA) + FOREST_FUNCS + /* wgsl */ `
 const AP_N: f32 = ${AP_RES}.0;
 const AP_MAX: f32 = ${AP_MAX_KM}.0;
 const EARTH_R: f32 = 6371000.0;
@@ -227,6 +232,9 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
   }
   lt.sun = sampleTrans(RG + ground.y * 0.001, lt.L.y) * F.sunDir.w;
   lt.moon = moonIlluminance();
+  let wet = Rain.amt.x;
+  let sunScale = mix(1.0, Rain.atmo.y, step(0.001, Rain.wind.w));
+  lt.sun *= sunScale;
   lt.zen = skyAtmo(vec3f(0.0, 1.0, 0.0));
   lt.hor = (skyAtmo(normalize(vec3f(1.0, 0.25, 0.0))) + skyAtmo(normalize(vec3f(-1.0, 0.25, 0.0)))
           + skyAtmo(normalize(vec3f(0.0, 0.25, 1.0))) + skyAtmo(normalize(vec3f(0.0, 0.25, -1.0)))) * 0.25;
@@ -234,8 +242,8 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
   let cover = clamp(F.cloudP.y * 0.8 + F.atmo.z * 0.3, 0.0, 1.0);
   let skyDim = 1.0 - 0.35 * cover;
   let glow = vec3f(0.002, 0.003, 0.005) * F.nightP.w;
-  lt.zen = lt.zen * skyDim + glow;
-  lt.hor = lt.hor * skyDim + glow;
+  lt.zen = lt.zen * skyDim * sunScale + glow;
+  lt.hor = lt.hor * skyDim * sunScale + glow;
 
   var col = vec3f(0.0);
   if (depth > 0.0) {
@@ -253,7 +261,7 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
     let sl = r1.yz * 0.021 + r2.yz * 0.018 * detail;
     let n = normalize(vec3f(-sl.x, 1.0, -sl.y));
     // unresolved ripples widen the sun glint with distance
-    let rough = 0.05 + 0.10 * smoothstep(0.5, 30.0, fp);
+    let rough = 0.05 + 0.10 * smoothstep(0.5, 30.0, fp) + wet * 0.14;
     let NdV = max(dot(n, V), 1e-3);
     let Fr = schlick(NdV, 0.02);
     var R = reflect(-V, n);
@@ -265,7 +273,7 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
     refl = mix(refl, bankCol, bankK * 0.75);
     let Hs = normalize(V + lt.L);
     let NdL = max(dot(n, lt.L), 0.0);
-    let glint = lt.sun * sunVis * ggx(max(dot(n, Hs), 0.0), rough) * schlick(dot(V, Hs), 0.02) * NdL / (4.0 * NdV);
+    var glint = lt.sun * sunVis * ggx(max(dot(n, Hs), 0.0), rough) * schlick(dot(V, Hs), 0.02) * NdL / (4.0 * NdV);
     let tannin = F.water.z;
     let deep = mix(vec3f(0.006, 0.016, 0.016), vec3f(0.016, 0.010, 0.004), tannin);
     let bed = groundAlbedo(xz, fp, 0.5, 0.0, 0.0, 0.0, 0.0) * mix(vec3f(0.7, 0.85, 0.8), vec3f(0.8, 0.6, 0.35), tannin);
@@ -273,6 +281,9 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
     let ext = exp(-path * mix(vec3f(0.45, 0.16, 0.12), vec3f(0.35, 0.55, 0.9), tannin));
     let lit = lt.sun * sunVis * max(lt.L.y, 0.0) + ambient(lt, vec3f(0.0, 1.0, 0.0));
     let body = (bed * ext + deep * (1.0 - ext)) * lit * (1.0 / PI);
+    let ripple = xz * (0.45 + wet * 1.4) + vec2f(t * 2.1, -t * 0.6);
+    let spark = pow(max(sin(ripple.x * 1.7) * sin(ripple.y * 1.3), 0.0), 12.0);
+    glint += lt.sun * sunVis * spark * wet * 0.22;
     col = body * (1.0 - Fr) + refl * Fr + glint;
   } else {
     // ---- land ----
@@ -353,6 +364,10 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
       farCol = mix(floorC, stand, closure);
     }
     col = select(mix(nearC, farCol, farK), farCol, F.forest.x <= 0.0) * (1.0 / PI);
+    // A water film darkens foliage and rock and lifts the leaf sheen.
+    col *= mix(1.0, 0.72, wet);
+    let sheen = pow(max(dot(normalize(V + lt.L), Ng), 0.0), 18.0) * wet * sunVis;
+    col += lt.sun * sheen * 0.015;
   }
 
   // ---- valley mist ----
@@ -371,6 +386,20 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
       let ph = mix(phaseHG(cosT, 0.6), phaseHG(cosT, -0.1), 0.5) * 4.0 * PI;
       let mistCol = lt.sun * cloudSh * sunUp * ph * 0.16 + (lt.zen * 0.6 + lt.hor * 0.4) * 0.9 + lt.moon * 0.3;
       col = col * Tm + mistCol * (1.0 - Tm);
+    }
+  }
+
+  // ---- precipitation between the camera and the valley ----
+  if (Rain.wind.w > 0.004) {
+    let snow = Rain.amt.y;
+    let thick = Rain.wind.w * mix(0.00042, 0.00018, snow);
+    let Tm = exp(-thick * dist);
+    let fogCol = mix(vec3f(0.58, 0.63, 0.7), vec3f(0.86, 0.89, 0.93), snow);
+    var litFog = (lt.zen * 0.62 + lt.hor * 0.38) * mix(0.5, 0.85, snow);
+    litFog += vec3f(0.62, 0.72, 0.95) * Rain.amt.z * 0.9;
+    col = col * Tm + fogCol * litFog * (1.0 - Tm);
+    if (Rain.bolt.w > 0.5) {
+      col += vec3f(0.42, 0.52, 0.78) * Rain.amt.z * (0.35 + 0.65 * max(Nt.y, 0.0));
     }
   }
 

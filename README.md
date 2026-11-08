@@ -54,6 +54,7 @@ Settings → **Scenery** chooses between the tour (in order or shuffled) and a s
 | Shift | 5× movement speed |
 | T | Show or hide the clock |
 | F | Show or hide the weather |
+| R | Turn rain on or off |
 | F1 or the Settings button | Open the settings panel |
 | Esc, H, or the × button | Close the settings panel |
 
@@ -65,6 +66,8 @@ The panel is an accordion with **General**, **Scenery** (Tour, Flight, Landscape
 
 The sky modes come from the ocean frame: Static, Dynamic (follows a ZIP code or place at the current time), Date and time, and Time lapse.
 
+**Sky → Rain** adds rain, thunderstorms, and snow. Rain is off until you turn it on, so an existing tour looks the same. Intensity is shown as a word (Drizzle through Violent; snow runs from Flurries to Blizzard). **Follow weather card** matches the live observation. **Dynamic / real-time** rain does that on its own, and a dynamic sky forces it on so the weather stays in step. A time lapse invents showers, winter snow, and thunderstorms as the sky clock advances, and locks the rain controls while it runs. Storms darken the cloud deck, wet the valley, and flash lightning. Snow is a higher, paler deck with flakes instead of streaks. Fog on the weather card stays dry; the valley already has its own mist.
+
 ## How it works
 
 - **Terrain** is a procedural height field: domain-warped gradient noise with rounded ridges, an erosion-style gully filter steered downhill, and a river valley carved out of it along a meandering path. It is baked by compute shaders into nine 512² clipmap levels (2 m to 512 m texels) that follow the camera, together with slope, curvature, and land-cover masks (forest density, conifer fraction, rock, snow).
@@ -72,6 +75,7 @@ The sky modes come from the ocean frame: Static, Dynamic (follows a ZIP code or 
 - **Trees** are individual crowns on a jittered grid — cones for conifers, paraboloid domes for broadleaves — sitting on an understory surface so dense stands close into one canopy. Crowns are displaced into the mesh close to the camera and shaded per pixel with foliage texture, translucency, and self-shadowing; further away a statistical canopy model takes over with the stand mosaic and the sun hotspot.
 - **Light** is physically scaled: sun and sky irradiance from the atmosphere model, Lambertian foliage and ground with measured-range albedos, mountain shadows marched through the clipmaps, cloud shadows, valley mist, and froxel aerial perspective.
 - **Water** reflects the sky and the wooded banks, shows its bed through clear or tannin-stained water, and carries flowing ripples and sun glint.
+- **Rain** is a column of streaks around the aircraft, plus a screen veil, a wetter darker valley, and a low gray deck. Thunderstorms add lightning in the sky and on the land. Snow falls slower, as flakes, under a paler deck. There is no rain sound.
 
 ## Development
 

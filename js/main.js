@@ -8,10 +8,11 @@ import { TRANS_LUT, MS_LUT, SKYVIEW_LUT, AP_LUT } from './wgsl/sky.js';
 import { CLIP_HEIGHT, CLIP_DERIVE, HEIGHT_PROBE } from './wgsl/terrain.js';
 import { SKY_BG, landWGSL } from './wgsl/land.js';
 import { BLOOM_DOWN, BLOOM_UP, COMPOSITE } from './wgsl/post.js';
+import { RAIN_DROP_INIT, RAIN_DROP_UPDATE, RAIN_DRAW, RAIN_MIST, MAX_DROPS } from './wgsl/rain.js';
 import { SCENES, sceneUniforms } from './scenes.js';
 import { celestialState } from './astronomy.js';
 import { createStarMapData, STAR_MAP_WIDTH, STAR_MAP_HEIGHT } from './star-catalog.js';
-import { createWeatherWidget } from './weather.js';
+import { createWeatherWidget, rainPresetForObservation } from './weather.js';
 import { acceptedPlace, rememberChoice, resolvePlace, suggestPlaces } from './place.js';
 
 const qs = new URLSearchParams(location.search);
@@ -105,6 +106,12 @@ export const P = {
   weatherWind: true,
   weatherForecast: true,
   weatherAlerts: true,
+  rainMode: 'static',
+  rain: false,
+  rainIntensity: 0.45,
+  rainStyle: 'rain',
+  rainFollow: false,
+  rainLightning: 0,
 };
 const DEFAULTS = { ...P };
 
@@ -285,10 +292,18 @@ async function main() {
   // --------------------------------------------------------------------------------------
   const MSAA = 4;
   const HDR = 'rgba16float';
-  const [landMod, skyMod, downMod, upMod, compMod] = await Promise.all([
+  const [landMod, skyMod, downMod, upMod, compMod, rainInitPipe, rainDropPipe, rainDrawMod, rainMistMod] = await Promise.all([
     shader(landWGSL(hasF32Filter), 'land'), shader(SKY_BG, 'sky'), shader(BLOOM_DOWN, 'bloom down'),
     shader(BLOOM_UP, 'bloom up'), shader(COMPOSITE, 'composite'),
+    computePipe(RAIN_DROP_INIT, 'rain init'),
+    computePipe(RAIN_DROP_UPDATE, 'rain drops'),
+    shader(RAIN_DRAW, 'rain draw'),
+    shader(RAIN_MIST, 'rain mist'),
   ]);
+  const PREMUL = {
+    color: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+    alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+  };
   const landPipe = await device.createRenderPipelineAsync({
     label: 'land', layout: 'auto',
     vertex: {
@@ -308,6 +323,30 @@ async function main() {
     depthStencil: { format: 'depth32float', depthWriteEnabled: false, depthCompare: 'equal' },
     multisample: { count: MSAA },
   });
+  const rainDepth = { format: 'depth32float', depthWriteEnabled: false, depthCompare: 'greater' };
+  const rainDrawPipe = await device.createRenderPipelineAsync({
+    label: 'rain draw', layout: 'auto',
+    vertex: { module: rainDrawMod, entryPoint: 'vs' },
+    fragment: { module: rainDrawMod, entryPoint: 'fs', targets: [{ format: HDR, blend: PREMUL }] },
+    primitive: { topology: 'triangle-list' },
+    depthStencil: rainDepth,
+    multisample: { count: MSAA },
+  });
+  const rainMistPipe = await device.createRenderPipelineAsync({
+    label: 'rain mist', layout: 'auto',
+    vertex: { module: rainMistMod, entryPoint: 'vs' },
+    fragment: { module: rainMistMod, entryPoint: 'fs', targets: [{ format: HDR, blend: PREMUL }] },
+    primitive: { topology: 'triangle-list' },
+    depthStencil: { format: 'depth32float', depthWriteEnabled: false, depthCompare: 'always' },
+    multisample: { count: MSAA },
+  });
+  const rainF = new Float32Array(32);
+  const rainUBO = mkBuf(128, GU.UNIFORM | GU.COPY_DST, 'rain ubo');
+  const dropBuf = mkBuf(MAX_DROPS * 32, GU.STORAGE, 'rain drops');
+  let rainInited = false;
+  let rainActive = 0;
+  let boltLife = 0, boltDur = 0.2, boltPower = 1, nextBolt = 2.5, lightningQuiet = true;
+  let boltFlash = 0, boltOn = 0, boltX = 0, boltZ = 1, boltSeed = 1;
   const downPipe = await device.createRenderPipelineAsync({
     label: 'bloom down', layout: 'auto',
     vertex: { module: downMod, entryPoint: 'vs' },
@@ -328,8 +367,12 @@ async function main() {
   });
 
   const bgLand = bg(landPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp, starView, apView,
-    arr(clipA), arr(clipB), { buffer: clipUBO }], 'land');
-  const bgSky = bg(skyPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp, starView], 'sky');
+    arr(clipA), arr(clipB), { buffer: clipUBO }, { buffer: rainUBO }], 'land');
+  const bgSky = bg(skyPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp, starView, { buffer: rainUBO }], 'sky');
+  const bgRainInit = bg(rainInitPipe, [{ buffer: rainUBO }, { buffer: dropBuf }], 'rain init');
+  const bgRainDrop = bg(rainDropPipe, [{ buffer: rainUBO }, { buffer: frameUBO }, { buffer: dropBuf }], 'rain drop');
+  const bgRainDraw = bg(rainDrawPipe, [{ buffer: frameUBO }, { buffer: rainUBO }, { buffer: dropBuf }], 'rain draw');
+  const bgRainMist = bg(rainMistPipe, [{ buffer: frameUBO }, { buffer: rainUBO }], 'rain mist');
 
   // CDLOD grid mesh
   const GRID = 32;
@@ -644,6 +687,7 @@ async function main() {
     if (e.ctrlKey || e.metaKey || e.altKey || shortcutField(e.target)) return;
     if (e.code === 'KeyT') toggleShown('clock');
     if (e.code === 'KeyF') toggleShown('weather');
+    if (e.code === 'KeyR') toggleShown('rain');
     if (e.code === 'KeyP') toggleShown('autopilot');
     if (e.code === 'BracketRight') requestScene(nextTourIndex(1));
     if (e.code === 'BracketLeft') requestScene(P.sceneMode === 'tour' ? nextTourIndex(-1) : tour.idx);
@@ -1000,6 +1044,17 @@ async function main() {
     return x * x * (3 - 2 * x);
   }
   function showDrivenSetting(key, value) {
+    if (key === 'rainIntensity') {
+      P.rainIntensity = value;
+      const control = controls.get(key);
+      if (control) {
+        const step = Number(control.input.step) || 0.01;
+        const shown = Math.round(value / step) * step;
+        control.input.value = String(Number(shown.toFixed(4)));
+      }
+      showRainReadout();
+      return;
+    }
     const control = controls.get(key);
     if (typeof DEFAULTS[key] === 'boolean') {
       P[key] = value;
@@ -1037,6 +1092,34 @@ async function main() {
     const front = 0.5 + 0.5 * wave(137, -0.8);
     return { elev, daylight, afternoon, wave, moisture, front };
   }
+  // Showers on the time-lapse clock. Moist spells last a couple of days, a passing band
+  // rains for a few hours, and the dry gaps are longer. A cold winter hour snows.
+  // Afternoon convection inside a wet band becomes a thunderstorm. The same instant
+  // always makes the same weather.
+  function simulatedRain(when) {
+    const { wave, moisture, front, afternoon, daylight, elev } = weatherField(when);
+    const mass = weatherSmooth(0.52, 0.72, moisture * 0.85 + front * 0.15);
+    const band = 0.5 + 0.5 * wave(17, 0.7);
+    const cell = 0.5 + 0.5 * wave(6.5, -1.1);
+    const pass = weatherSmooth(0.58, 0.78, band * 0.72 + cell * 0.28);
+    const wet = mass * pass;
+    const pulse = 0.5 + 0.5 * wave(3.4, 1.2);
+    let intensity = wet * (0.2 + 0.75 * wet * (0.3 + 0.7 * pulse));
+    const month = when.getMonth();
+    const latitude = Math.abs(skyLocation?.latitude ?? 47);
+    const cold = latitude > 28 && (month <= 1 || month >= 11) && elev < 28;
+    const convective = wet * afternoon * daylight * weatherSmooth(0.5, 0.85, cell) * weatherSmooth(0.4, 0.8, moisture);
+    let style = cold ? 'snow' : 'rain';
+    let lightning = 0;
+    if (!cold && convective > 0.45 && intensity > 0.08) {
+      style = 'thunderstorm';
+      intensity = Math.min(1, Math.max(intensity, 0.55 + 0.4 * convective));
+      lightning = Math.min(1, 0.45 + 0.5 * convective);
+    }
+    intensity = Math.max(0, Math.min(1, intensity));
+    if (intensity < 0.04) return { rain: false, intensity: 0, style: 'rain', lightning: 0 };
+    return { rain: true, intensity, style, lightning };
+  }
   function updateDynamicClouds() {
     if (P.cloudMode !== 'dynamic') return;
     const when = skyUsesPlace() && skyInstant ? skyInstant : new Date();
@@ -1045,23 +1128,27 @@ async function main() {
     const lowDir = (225 + 65 * wave(121, 0.4) + 25 * wave(43, -1.2) + 360) % 360;
     const lowWind = 3 + 10 * front + 4 * (0.5 + 0.5 * wave(31, 2.3));
     const lowSun = Math.exp(-((elev - 6) ** 2) / 180) * weatherSmooth(-3, 4, elev);
+    const showWeatherCloud = (key, value) => {
+      if (rainAmount() > 0.02 && RAIN_CLOUDS.includes(key)) return;
+      showDrivenSetting(key, value);
+    };
     showDrivenSetting('cloudMotion', true);
-    showDrivenSetting('clouds', Math.min(0.92, 0.04 + 0.72 * moisture + 0.16 * convection * (1 - 0.55 * moisture)));
-    showDrivenSetting('cloudAltitude', 0.75 + 1.8 * (1 - moisture) + 0.35 * convection);
-    showDrivenSetting('cloudScale', 0.75 + 0.65 * (1 - moisture) + 0.25 * convection);
-    showDrivenSetting('cloudDensity', 0.8 + 3.4 * moisture + 0.5 * convection);
+    showWeatherCloud('clouds', Math.min(0.92, 0.04 + 0.72 * moisture + 0.16 * convection * (1 - 0.55 * moisture)));
+    showWeatherCloud('cloudAltitude', 0.75 + 1.8 * (1 - moisture) + 0.35 * convection);
+    showWeatherCloud('cloudScale', 0.75 + 0.65 * (1 - moisture) + 0.25 * convection);
+    showWeatherCloud('cloudDensity', 0.8 + 3.4 * moisture + 0.5 * convection);
     showDrivenSetting('cloudWindSpeed', lowWind);
     showDrivenSetting('cloudWindDir', lowDir);
     showDrivenSetting('cloudEvolution', 0.15 + 0.65 * Math.min(1, lowWind / 18) + 0.35 * convection);
-    showDrivenSetting('veil', Math.min(0.82, 0.03 + 0.55 * (0.55 * front + 0.45 * moisture)));
+    showWeatherCloud('veil', Math.min(0.82, 0.03 + 0.55 * (0.55 * front + 0.45 * moisture)));
     showDrivenSetting('highCloudAltitude', 7 + 3 * (1 - front));
     showDrivenSetting('highCloudScale', 0.75 + 0.7 * (1 - front));
-    showDrivenSetting('highCloudDensity', 0.3 + 1.25 * (0.55 * front + 0.45 * moisture));
+    showWeatherCloud('highCloudDensity', 0.3 + 1.25 * (0.55 * front + 0.45 * moisture));
     showDrivenSetting('highCloudWindSpeed', 18 + 25 * front + 8 * (0.5 + 0.5 * wave(53, 0.7)));
     showDrivenSetting('highCloudWindDir', (lowDir + 24 + 16 * wave(83, 2.5) + 360) % 360);
-    showDrivenSetting('cloudSoftness', 0.75 + 0.55 * moisture + 0.15 * (1 - daylight));
-    showDrivenSetting('cloudSilver', 0.15 + 1.55 * lowSun);
-    showDrivenSetting('cloudAmbient', 0.85 + 0.4 * daylight);
+    showWeatherCloud('cloudSoftness', 0.75 + 0.55 * moisture + 0.15 * (1 - daylight));
+    showWeatherCloud('cloudSilver', 0.15 + 1.55 * lowSun);
+    showWeatherCloud('cloudAmbient', 0.85 + 0.4 * daylight);
   }
   function updateDynamicStars() {
     if (P.starMode !== 'dynamic') return;
@@ -1232,10 +1319,10 @@ async function main() {
   const panelBody = document.getElementById('panel-body');
   const BOOL_KEYS = new Set(['showButtons', 'showInfo', 'clock', 'clock24h', 'clockSeconds', 'clockDate',
     'weather', 'weatherTemp', 'weatherFeels', 'weatherPrecip', 'weatherHumidity', 'weatherWind', 'weatherForecast', 'weatherAlerts',
-    'sceneLabel', 'sceneSky', 'autopilot', 'moon', 'stars', 'cloudMotion']);
+    'sceneLabel', 'sceneSky', 'autopilot', 'moon', 'stars', 'cloudMotion', 'rain', 'rainFollow']);
   const STRING_KEYS = new Set(['clockStyle', 'clockColor', 'clockPosition', 'weatherZip', 'weatherUnit', 'weatherPosition',
     'sceneMode', 'scene', 'tourOrder',
-    'skyMode', 'zipCode', 'skyWhen', 'skyLapseStart', 'cloudMode', 'starMode']);
+    'skyMode', 'zipCode', 'skyWhen', 'skyLapseStart', 'cloudMode', 'starMode', 'rainMode', 'rainStyle']);
   const SUN_DRIVEN = ['sunElev', 'sunAzim'];
   const CLOUD_DRIVEN = [
     'cloudMotion', 'cloudWindSpeed', 'cloudWindDir', 'cloudEvolution',
@@ -1244,6 +1331,13 @@ async function main() {
     'veil', 'highCloudDensity', 'cloudSoftness', 'cloudSilver', 'cloudAmbient',
   ];
   const STAR_DRIVEN = ['starDensity', 'starBrightness', 'starTwinkle', 'starSeed', 'nightBrightness'];
+  const RAIN_DRIVEN = ['rain', 'rainIntensity', 'rainStyle', 'rainLightning'];
+  const LAPSE_RAIN = ['rain', 'rainIntensity', 'rainStyle', 'rainLightning'];
+  // A raining sky is a nimbostratus deck: low, broad, soft, and gray.
+  const RAIN_CLOUDS = [
+    'clouds', 'cloudAltitude', 'cloudScale', 'cloudDensity',
+    'veil', 'highCloudDensity', 'cloudSoftness', 'cloudSilver', 'cloudAmbient',
+  ];
   const MOON_DRIVEN = ['moon', 'moonElev', 'moonAzim', 'moonPhase', 'moonSize', 'moonBrightness'];
   // Scene presets set the sun, haze and cloud deck of each region unless the placed sky or
   // dynamic clouds already own those settings.
@@ -1254,6 +1348,11 @@ async function main() {
   let moonManual = null;
   let sceneSkyManual = null;
   let weatherWidget = null;
+  let rainManual = null;
+  let dynamicRainManual = null;
+  let lapseRainManual = null;
+  let rainCloudManual = null;
+  let rainIntensityShown = '';
   let uiReady = false;
   const SETTINGS_KEY = 'web-scenery-settings-v1';
   const SECTIONS = [
@@ -1429,6 +1528,26 @@ async function main() {
         ['exposure', 'Exposure', 0.1, 4, 0.01, ''],
         ['bloom', 'Bloom', 0, 0.3, 0.001, ''],
       ] },
+      { title: 'Rain', settings: [
+        ['rainMode', 'Rain behavior', 'select', [
+          ['static', 'Static'],
+          ['dynamic', 'Dynamic / real-time'],
+        ]],
+      ], groups: [
+        { title: 'Weather', settings: [
+          ['rain', 'Rain', 'toggle', 'On', 'Off'],
+          ['rainIntensity', 'Intensity', 0, 1, 0.01, 'rain'],
+          ['rainStyle', 'Style', 'select', [
+            ['rain', 'Rain'],
+            ['thunderstorm', 'Thunderstorm'],
+            ['snow', 'Snow'],
+          ]],
+          ['rainFollow', 'Follow weather card', 'toggle', 'On', 'Off'],
+        ] },
+        { title: 'Storm', settings: [
+          ['rainLightning', 'Lightning', 0, 1, 0.01, 'rain'],
+        ] },
+      ] },
     ] },
   ];
   const RANGES = new Map();
@@ -1444,6 +1563,7 @@ async function main() {
     else if (typeof setting[2] === 'number') RANGES.set(setting[0], [setting[2], setting[3]]);
   });
   function coerceSetting(key, raw) {
+    if (key === 'rainStyle' && raw === 'hurricane') raw = 'thunderstorm';
     if (BOOL_KEYS.has(key)) return booleanSetting(raw);
     if (CHOICES.has(key)) return CHOICES.get(key).has(raw) ? raw : undefined;
     if (key === 'zipCode' || key === 'weatherZip') {
@@ -1478,7 +1598,11 @@ async function main() {
   function storedSettingValue(key) {
     if (sceneSkyManual && Object.hasOwn(sceneSkyManual, key)) return sceneSkyManual[key];
     if (sunManual && SUN_DRIVEN.includes(key)) return sunManual[key];
+    if (rainCloudManual && Object.hasOwn(rainCloudManual, key)) return rainCloudManual[key];
     if (cloudManual && CLOUD_DRIVEN.includes(key)) return cloudManual[key];
+    if (dynamicRainManual && Object.hasOwn(dynamicRainManual, key)) return dynamicRainManual[key];
+    if (lapseRainManual && Object.hasOwn(lapseRainManual, key)) return lapseRainManual[key];
+    if (rainManual && Object.hasOwn(rainManual, key)) return rainManual[key];
     if (starManual && STAR_DRIVEN.includes(key)) return starManual[key];
     if (moonManual && MOON_DRIVEN.includes(key)) return moonManual[key];
     return P[key];
@@ -1787,6 +1911,7 @@ async function main() {
       ['[ ]', 'Previous or next scene'],
       ['T', 'Show or hide the clock'],
       ['F', 'Show or hide the weather'],
+      ['R', 'Turn rain on or off'],
       ['W A S D', 'Move (free flight)'],
       ['Space or E', 'Move up (free flight)'],
       ['Q or C', 'Move down (free flight)'],
@@ -1849,7 +1974,7 @@ async function main() {
     const token = ++statusToken;
     setTimeout(() => { if (token === statusToken) status.textContent = ''; }, 4000);
   }
-  weatherWidget = createWeatherWidget(document.getElementById('weather-widget'), note, () => {});
+  weatherWidget = createWeatherWidget(document.getElementById('weather-widget'), note, () => updateFollowedRain());
   document.getElementById('weather-widget').addEventListener('click', (event) => {
     if (event.target.closest('.weather-place')) openPlaceDialog('weatherZip');
   });
@@ -1948,6 +2073,7 @@ async function main() {
   // Something other than the scene preset owns this setting.
   function skyKeyOwned(key) {
     if (SUN_DRIVEN.includes(key)) return skyUsesPlace();
+    if (RAIN_CLOUDS.includes(key) && rainAmount() > 0.02) return true;
     if (CLOUD_DRIVEN.includes(key)) return P.cloudMode === 'dynamic';
     return false;
   }
@@ -2025,7 +2151,16 @@ async function main() {
     setSettingVisible('skyWhen', dated);
     setSettingVisible('skyLapseStart', lapse);
     setSettingVisible('lapsePace', lapse);
-    if (lapse) resetTimeLapse();
+    if (lapse) {
+      resetTimeLapse();
+      captureLapseRain();
+      // Snapshot the manual deck before a raining lapse replaces it.
+      if (cloudManual || P.cloudMode !== 'dynamic') updateLapseRain();
+    } else {
+      releaseLapseRain();
+    }
+    forceDynamicRainForSky();
+    applyRainMode();
     if (dated && !P.skyWhen) {
       P.skyWhen = localDateTimeValue();
       const when = controls.get('skyWhen');
@@ -2036,6 +2171,7 @@ async function main() {
     if (!placed) liveSky = skyInstant = null;
     else if (resolveLocation) resolveZipCode();
     applySceneSky();
+    updateRainClouds();
   }
   function applySceneControls() {
     const single = P.sceneMode !== 'tour';
@@ -2279,12 +2415,281 @@ async function main() {
     event.stopPropagation();
     closePlaceDialog();
   });
+  function rainAmount() {
+    return P.rain ? Math.max(0, Math.min(1, P.rainIntensity)) : 0;
+  }
+  function rainWord(value) {
+    if (P.rainStyle === 'snow') {
+      if (value < 0.04) return 'None';
+      if (value < 0.22) return 'Flurries';
+      if (value < 0.45) return 'Light';
+      if (value < 0.7) return 'Moderate';
+      if (value < 0.88) return 'Heavy';
+      return 'Blizzard';
+    }
+    if (value < 0.04) return 'None';
+    if (value < 0.18) return 'Drizzle';
+    if (value < 0.38) return 'Light';
+    if (value < 0.62) return 'Moderate';
+    if (value < 0.84) return 'Heavy';
+    return 'Violent';
+  }
+  function showRainReadout() {
+    const control = controls.get('rainIntensity');
+    if (!control?.output) return;
+    control.output.textContent = rainWord(P.rainIntensity);
+    control.output.title = Number(P.rainIntensity).toFixed(2);
+  }
+  function presentRainIntensity() {
+    const control = controls.get('rainIntensity');
+    if (!control?.output) return;
+    const step = Number(control.input.step) || 0.01;
+    const shown = Math.round(P.rainIntensity / step) * step;
+    const text = String(Number(shown.toFixed(4)));
+    const word = rainWord(P.rainIntensity);
+    if (rainIntensityShown === text && control.output.textContent === word) return;
+    rainIntensityShown = text;
+    control.input.value = text;
+    control.output.textContent = word;
+    control.output.title = Number(P.rainIntensity).toFixed(2);
+  }
+  function showDrivenChoice(key, value) {
+    P[key] = value;
+    const control = controls.get(key);
+    if (control?.input) control.input.value = value;
+  }
+  function manualRainValue(key) {
+    if (dynamicRainManual && Object.hasOwn(dynamicRainManual, key)) return dynamicRainManual[key];
+    if (rainManual && Object.hasOwn(rainManual, key)) return rainManual[key];
+    if (lapseRainManual && Object.hasOwn(lapseRainManual, key)) return lapseRainManual[key];
+    return P[key];
+  }
+  function captureLapseRain() {
+    if (lapseRainManual) return;
+    lapseRainManual = {};
+    for (const key of LAPSE_RAIN) lapseRainManual[key] = manualRainValue(key);
+  }
+  function releaseLapseRain() {
+    if (!lapseRainManual) return;
+    const saved = lapseRainManual;
+    lapseRainManual = null;
+    rainIntensityShown = '';
+    if (P.rainMode === 'dynamic') return;
+    showDrivenSetting('rain', saved.rain);
+    showDrivenSetting('rainIntensity', saved.rainIntensity);
+    showDrivenChoice('rainStyle', saved.rainStyle);
+    showDrivenSetting('rainLightning', saved.rainLightning);
+  }
+  function updateLapseRain() {
+    if (P.skyMode !== 'lapse' || !lapseRainManual) return;
+    const when = lapseInstant();
+    if (!when) return;
+    const next = simulatedRain(when);
+    const rainChanged = P.rain !== next.rain;
+    const styleChanged = P.rainStyle !== next.style;
+    P.rainIntensity = next.intensity;
+    presentRainIntensity();
+    if (Math.abs(P.rainLightning - next.lightning) >= 0.005) showDrivenSetting('rainLightning', next.lightning);
+    if (styleChanged) showDrivenChoice('rainStyle', next.style);
+    if (rainChanged) showDrivenSetting('rain', next.rain);
+    if (rainChanged || styleChanged) updateRainClouds();
+  }
+  function raiseLightning(style) {
+    if (style === 'snow') {
+      if (P.rainLightning > 0) showDrivenSetting('rainLightning', 0);
+      return;
+    }
+    const floor = style === 'thunderstorm' ? 0.55 : 0;
+    if (floor > P.rainLightning) showDrivenSetting('rainLightning', floor);
+  }
+  function rainIsWeatherDriven() {
+    return P.rainMode === 'dynamic' && P.skyMode !== 'lapse' && (P.weather || P.skyMode === 'dynamic');
+  }
+  function rainControlsLocked() {
+    return P.skyMode === 'lapse' || rainIsWeatherDriven();
+  }
+  function snapshotDynamicRain() {
+    if (dynamicRainManual) return;
+    dynamicRainManual = {};
+    for (const key of RAIN_DRIVEN) dynamicRainManual[key] = manualRainValue(key);
+  }
+  function restoreDynamicRain() {
+    if (!dynamicRainManual) return;
+    const saved = dynamicRainManual;
+    dynamicRainManual = null;
+    rainIntensityShown = '';
+    if (P.skyMode === 'lapse') {
+      if (lapseRainManual) {
+        for (const key of LAPSE_RAIN) lapseRainManual[key] = saved[key];
+      }
+      return;
+    }
+    for (const key of RAIN_DRIVEN) {
+      if (key === 'rainStyle') showDrivenChoice(key, saved[key]);
+      else showDrivenSetting(key, saved[key]);
+    }
+  }
+  function applyRainPreset(next) {
+    if (!next) return;
+    const rainChanged = P.rain !== next.rain;
+    const styleChanged = P.rainStyle !== next.style;
+    if (Math.abs(P.rainIntensity - next.intensity) >= 0.005) showDrivenSetting('rainIntensity', next.intensity);
+    if (Math.abs(P.rainLightning - next.lightning) >= 0.005) showDrivenSetting('rainLightning', next.lightning);
+    if (styleChanged) showDrivenChoice('rainStyle', next.style);
+    if (rainChanged) showDrivenSetting('rain', next.rain);
+    if (rainChanged || styleChanged) updateRainClouds();
+  }
+  function syncRainModeControl() {
+    const control = controls.get('rainMode');
+    const option = control?.input?.querySelector('option[value="dynamic"]');
+    const skyDynamic = P.skyMode === 'dynamic';
+    if (option) {
+      option.disabled = !P.weather && !skyDynamic;
+      option.title = option.disabled ? 'Turn on the weather widget first' : '';
+    }
+    if (control?.input) {
+      control.input.title = skyDynamic
+        ? 'Dynamic sky keeps rain in real-time mode'
+        : P.skyMode === 'lapse' ? 'Time lapse drives the rain' : '';
+    }
+    setSettingLocked('rainMode', skyDynamic || P.skyMode === 'lapse');
+  }
+  function updateFollowedRain() {
+    if (P.skyMode === 'lapse' || !weatherWidget) return;
+    const obs = weatherWidget.getObservation();
+    if (!obs) return;
+    const preset = rainPresetForObservation(obs);
+    if (!preset) return;
+    if (P.rainMode === 'dynamic') {
+      applyRainPreset(preset);
+      return;
+    }
+    if (!(P.rain && P.rainFollow)) return;
+    if (Math.abs(P.rainIntensity - preset.intensity) > 0.02) showDrivenSetting('rainIntensity', preset.intensity);
+    if (P.rainStyle !== preset.style) {
+      showDrivenChoice('rainStyle', preset.style);
+      raiseLightning(preset.style);
+      updateRainClouds();
+    }
+  }
+  function applyRainFollow() {
+    const lapse = P.skyMode === 'lapse';
+    const driven = rainIsWeatherDriven();
+    const follow = Boolean(P.rain && P.rainFollow) && !lapse && !driven;
+    if (!lapse && !driven) {
+      if (follow && !rainManual) rainManual = { rainIntensity: P.rainIntensity, rainStyle: P.rainStyle };
+      if (!follow && rainManual) {
+        const saved = rainManual;
+        rainManual = null;
+        showDrivenSetting('rainIntensity', saved.rainIntensity);
+        showDrivenChoice('rainStyle', saved.rainStyle);
+      }
+    }
+    setSettingLocked('rain', lapse || driven);
+    setSettingLocked('rainFollow', lapse || driven || !P.rain);
+    setSettingLocked('rainIntensity', lapse || driven || follow);
+    setSettingLocked('rainStyle', lapse || driven || follow);
+    setSettingLocked('rainLightning', lapse || driven);
+    if (driven || follow) updateFollowedRain();
+    updateRainClouds();
+  }
+  function acceptRainMode(value) {
+    const control = controls.get('rainMode');
+    const locked = (P.skyMode === 'dynamic' && value !== 'dynamic') || (P.skyMode === 'lapse' && value !== P.rainMode);
+    if (locked || (value === 'dynamic' && !P.weather && P.skyMode !== 'dynamic')) {
+      if (control) control.input.value = P.rainMode;
+      if (!locked && value === 'dynamic') note('Turn on the weather widget before using dynamic rain');
+      return false;
+    }
+    return true;
+  }
+  function applyRainMode() {
+    if (P.rainMode === 'dynamic' && !P.weather && P.skyMode !== 'dynamic') showDrivenChoice('rainMode', 'static');
+    if (P.rainMode === 'dynamic') snapshotDynamicRain();
+    else restoreDynamicRain();
+    syncRainModeControl();
+    applyRainFollow();
+  }
+  function forceDynamicRainForSky() {
+    if (P.skyMode !== 'dynamic') return;
+    let changed = false;
+    if (!P.weather) {
+      showDrivenSetting('weather', true);
+      changed = true;
+    }
+    if (P.rainMode !== 'dynamic') {
+      showDrivenChoice('rainMode', 'dynamic');
+      changed = true;
+    }
+    if (changed) rememberSettings();
+    if (changed && weatherWidget) applyWeather(true);
+  }
+  function driveCloud(key, value) {
+    const control = controls.get(key);
+    if (control) value = Math.min(control.max, Math.max(control.min, value));
+    showDrivenSetting(key, value);
+  }
+  function updateRainClouds() {
+    const on = rainAmount() > 0.02;
+    if (on && !rainCloudManual && P.cloudMode !== 'dynamic') {
+      rainCloudManual = {};
+      for (const key of RAIN_CLOUDS) rainCloudManual[key] = P[key];
+    }
+    if (!on && rainCloudManual) {
+      const saved = rainCloudManual;
+      rainCloudManual = null;
+      if (P.cloudMode !== 'dynamic') {
+        for (const key of Object.keys(saved)) showDrivenSetting(key, saved[key]);
+      }
+      if (P.sceneSky) applySceneSky();
+    }
+    const dynamic = P.cloudMode === 'dynamic';
+    for (const key of RAIN_CLOUDS) {
+      const sceneLocked = P.sceneSky && SCENE_SKY.includes(key);
+      setSettingLocked(key, on || dynamic || sceneLocked);
+    }
+    if (!on) return;
+    const a = rainAmount();
+    const storm = P.rainStyle === 'thunderstorm' ? 1 : 0;
+    const snow = P.rainStyle === 'snow' ? 1 : 0;
+    if (snow) {
+      driveCloud('clouds', 0.7 + 0.22 * a);
+      driveCloud('cloudAltitude', 1.7 - 0.35 * a);
+      driveCloud('cloudScale', 1.35 + 0.45 * a);
+      driveCloud('cloudDensity', 1.5 + 1.3 * a);
+      driveCloud('veil', 0.4 + 0.28 * a);
+      driveCloud('highCloudDensity', 0.55 + 0.45 * a);
+      driveCloud('cloudSoftness', 1.35 + 0.4 * a);
+      driveCloud('cloudSilver', 0.85 - 0.25 * a);
+      driveCloud('cloudAmbient', 0.95 - 0.1 * a);
+      return;
+    }
+    driveCloud('clouds', 0.78 + 0.18 * a + 0.03 * storm);
+    driveCloud('cloudAltitude', Math.max(0.55, 1.25 - 0.55 * a - 0.1 * storm));
+    driveCloud('cloudScale', 1.55 + 0.9 * a);
+    driveCloud('cloudDensity', 3.0 + 1.8 * a + 0.45 * storm);
+    driveCloud('veil', 0.55 + 0.3 * a + 0.08 * storm);
+    driveCloud('highCloudDensity', 1.05 + 0.55 * a);
+    driveCloud('cloudSoftness', 1.55 + 0.6 * a);
+    driveCloud('cloudSilver', Math.max(0, 0.38 - 0.22 * a - 0.08 * storm));
+    driveCloud('cloudAmbient', Math.max(0, 0.7 - 0.18 * a - 0.08 * storm));
+  }
   function commitSetting(key, value) {
     if (!Object.hasOwn(P, key)) return false;
     visitOnly.delete(key);
     const control = controls.get(key);
     if (BOOL_KEYS.has(key)) {
       if (typeof value !== 'boolean') return false;
+      if (key === 'weather' && value === false && P.skyMode === 'dynamic') {
+        if (control) control.input.checked = true;
+        note('Dynamic sky keeps weather on so rain can follow it');
+        return false;
+      }
+      if (key === 'rain' && value !== P.rain && rainControlsLocked()) {
+        if (control) control.input.checked = P.rain;
+        note(P.skyMode === 'lapse' ? 'Time lapse drives the rain' : 'Dynamic rain follows the weather card');
+        return false;
+      }
       P[key] = value;
       if (control) {
         control.input.checked = value;
@@ -2298,6 +2703,15 @@ async function main() {
         applyAutopilotButton();
       }
       if (key === 'sceneSky') applySceneSky();
+      if (key === 'rain' || key === 'rainFollow') applyRainFollow();
+      if (key === 'rainFollow') applyWeather(true);
+      if (key === 'weather') {
+        if (!P.weather && P.rainMode === 'dynamic' && P.skyMode !== 'dynamic') {
+          showDrivenChoice('rainMode', 'static');
+          note('Dynamic rain needs the weather widget');
+        }
+        applyRainMode();
+      }
       if (key === 'sceneLabel' && !value) hideSceneLabel();
       keepManualSetting(key);
       rememberSettings();
@@ -2306,6 +2720,7 @@ async function main() {
     if (STRING_KEYS.has(key)) {
       value = coerceSetting(key, value);
       if (value === undefined) return false;
+      if (key === 'rainMode' && !acceptRainMode(value)) return false;
       const prev = P[key];
       P[key] = value;
       if (control) control.input.value = value;
@@ -2314,6 +2729,11 @@ async function main() {
       if (key === 'zipCode' || key === 'weatherZip') refreshPlaceLabel(key);
       if (key === 'skyMode') applySkyMode(true);
       if (key === 'cloudMode') applyCloudMode();
+      if (key === 'rainMode') applyRainMode();
+      if (key === 'rainStyle') {
+        if (!rainControlsLocked() && !(P.rain && P.rainFollow)) raiseLightning(value);
+        updateRainClouds();
+      }
       if (key === 'starMode') applyStarMode();
       if (key === 'sceneMode') {
         applySceneControls();
@@ -2335,6 +2755,8 @@ async function main() {
     }
     P[key] = value;
     const kind = control ? control.kind : '';
+    if (key === 'rainIntensity') showRainReadout();
+    if (key === 'rainIntensity' || key === 'rainLightning') updateRainClouds();
     if (kind === 'lut') needLUT = true;
     if (kind === 'clock') applyClock();
     if (kind === 'weather') applyWeather();
@@ -2351,6 +2773,10 @@ async function main() {
     if (cloudManual && CLOUD_DRIVEN.includes(key)) cloudManual[key] = P[key];
     if (starManual && STAR_DRIVEN.includes(key)) starManual[key] = P[key];
     if (moonManual && MOON_DRIVEN.includes(key)) moonManual[key] = P[key];
+    if (rainManual && Object.hasOwn(rainManual, key)) rainManual[key] = P[key];
+    if (dynamicRainManual && Object.hasOwn(dynamicRainManual, key)) dynamicRainManual[key] = P[key];
+    if (lapseRainManual && Object.hasOwn(lapseRainManual, key)) lapseRainManual[key] = P[key];
+    if (rainCloudManual && Object.hasOwn(rainCloudManual, key)) rainCloudManual[key] = P[key];
     if (skyUsesPlace() && SUN_DRIVEN.includes(key)) updateDrivenSun();
     if (skyUsesPlace() && MOON_DRIVEN.includes(key)) updateDrivenMoon();
     if (P.cloudMode === 'dynamic' && CLOUD_DRIVEN.includes(key)) updateDynamicClouds();
@@ -2399,6 +2825,11 @@ async function main() {
     starManual = null;
     moonManual = null;
     sceneSkyManual = null;
+    rainManual = null;
+    dynamicRainManual = null;
+    lapseRainManual = null;
+    rainCloudManual = null;
+    rainIntensityShown = '';
     for (const key of Object.keys(DEFAULTS)) commitSetting(key, DEFAULTS[key]);
     resetView();
     note('Reset to defaults');
@@ -2451,6 +2882,7 @@ async function main() {
   applyStarMode();
   applyWeather(true);
   applySkyMode();
+  showRainReadout();
   if (skyUsesPlace()) resolveZipCode();
   refreshPlaceLabel('zipCode');
   refreshPlaceLabel('weatherZip');
@@ -2477,6 +2909,83 @@ async function main() {
   let fpsAcc = 0, fpsN = 0, fpsT = 0;
   let shooting = false;
 
+  function updateLightning(dt) {
+    const amount = rainAmount();
+    const rate = amount > 0.02 && P.rainStyle !== 'snow' ? Math.max(0, Math.min(1, P.rainLightning)) : 0;
+    if (boltLife > 0) {
+      boltLife -= dt;
+      const flick = Math.sin(boltLife * 78) > -0.15 ? 1 : 0.28;
+      boltFlash = Math.max(0, boltLife / boltDur) * flick * boltPower;
+      boltOn = boltFlash > 0.02 ? 1 : 0;
+    } else {
+      boltFlash = 0;
+      boltOn = 0;
+    }
+    if (rate < 0.01) {
+      lightningQuiet = true;
+      return;
+    }
+    if (lightningQuiet && P.skyMode === 'lapse') {
+      const pace = Math.max(1, Number(P.lapsePace) || 20);
+      nextBolt = Math.min(nextBolt, 0.15 + 1.5 / pace);
+    }
+    lightningQuiet = false;
+    nextBolt -= dt;
+    if (nextBolt > 0) return;
+    const mean = Math.max(1.4, 18 * (1 - rate) + 1.5);
+    nextBolt = mean * (0.4 + Math.random() * 0.9);
+    const az = Math.random() * Math.PI * 2;
+    boltX = Math.cos(az);
+    boltZ = Math.sin(az);
+    boltSeed = Math.random() * 200;
+    boltDur = 0.14 + Math.random() * 0.2;
+    boltLife = boltDur;
+    boltPower = 0.65 + Math.random() * 0.55;
+    boltFlash = boltPower;
+    boltOn = 1;
+  }
+  function writeRainUniforms(dt) {
+    const amount = rainAmount();
+    const style = P.rainStyle === 'snow' ? 2 : P.rainStyle === 'thunderstorm' ? 1 : 0;
+    const storm = style === 1 ? 1 : 0;
+    const snow = style === 2 ? 1 : 0;
+    const dir = P.cloudWindDir * D2R;
+    const speed = Math.max(2, P.cloudWindSpeed);
+    rainF[0] = cam.x; rainF[1] = cam.y; rainF[2] = cam.z; rainF[3] = simTime;
+    rainF[4] = Math.sin(dir); rainF[5] = -Math.cos(dir); rainF[6] = speed; rainF[7] = amount;
+    rainF[8] = amount * (1 - snow); rainF[9] = snow; rainF[10] = boltFlash; rainF[11] = style;
+    rainF[12] = boltX; rainF[13] = boltZ; rainF[14] = boltSeed; rainF[15] = boltOn;
+    const count = snow ? 900 + amount * amount * 6800 : 420 + amount * amount * 6200;
+    rainActive = amount <= 0.004 ? 0 : Math.min(MAX_DROPS, Math.floor(count));
+    rainF[16] = 0; rainF[17] = dt; rainF[18] = rainActive;
+    rainF[19] = Math.min(1, 0.16 + amount * 0.4 + storm * 0.18 + snow * 0.22);
+    rainF[20] = 0; rainF[21] = 0; rainF[22] = 0; rainF[23] = 0;
+    const shade = (storm * 0.22 + 0.42) * (1 - snow * 0.45);
+    const sunCut = (0.4 + storm * 0.22) * (1 - snow * 0.35);
+    rainF[24] = 0;
+    rainF[25] = amount > 0 ? Math.max(0.34, 1 - amount * sunCut) : 1;
+    rainF[26] = amount > 0 ? Math.max(0.28, 1 - amount * shade) : 1;
+    rainF[27] = 0.3 + storm * 0.35;
+    rainF[28] = snow ? 1.3 + amount * 0.9 : 10 + amount * 7;
+    rainF[29] = 20 + amount * (snow ? 28 : 22);
+    rainF[30] = 40 + amount * (snow ? 70 : 100);
+    rainF[31] = 0;
+    device.queue.writeBuffer(rainUBO, 0, rainF);
+  }
+  function encodeRain(cp) {
+    if (!rainInited) {
+      cp.setPipeline(rainInitPipe);
+      cp.setBindGroup(0, bgRainInit);
+      cp.dispatchWorkgroups(Math.ceil(MAX_DROPS / 64));
+      rainInited = true;
+      return;
+    }
+    if (rainActive > 0) {
+      cp.setPipeline(rainDropPipe);
+      cp.setBindGroup(0, bgRainDrop);
+      cp.dispatchWorkgroups(Math.ceil(rainActive / 64));
+    }
+  }
   function frame(now) {
     if (shooting) return;  // paused while a screenshot is read back
     requestAnimationFrame(frame);
@@ -2492,8 +3001,11 @@ async function main() {
       fpsAcc = 0; fpsN = 0; fpsT = 0;
     }
     advanceTimeLapse(dt);
+    updateLapseRain();
     updateDynamicClouds();
     updateDynamicStars();
+    updateFollowedRain();
+    updateRainClouds();
     if (fixedDt) dt = fixedDt;
     advanceCloudMotion(dt);
     updateTour(dt);
@@ -2501,6 +3013,8 @@ async function main() {
     simTime += dt;
     if (simTime > 4096) simTime -= 4096;
     frameIndex++;
+    updateLightning(dt);
+    writeRainUniforms(dt);
 
     writeFrame(simTime);
     selectAll();
@@ -2534,6 +3048,7 @@ async function main() {
     cp.setPipeline(apPipe);
     cp.setBindGroup(0, bgAP);
     cp.dispatchWorkgroups(Math.ceil(AP_RES / 8), Math.ceil(AP_RES / 8));
+    encodeRain(cp);
     cp.end();
 
     const rp = enc.beginRenderPass(mainPass);
@@ -2547,6 +3062,14 @@ async function main() {
     rp.setPipeline(skyPipe);
     rp.setBindGroup(0, bgSky);
     rp.draw(3);
+    if (rainActive > 0) {
+      rp.setPipeline(rainDrawPipe);
+      rp.setBindGroup(0, bgRainDraw);
+      rp.draw(rainActive * 6);
+      rp.setPipeline(rainMistPipe);
+      rp.setBindGroup(0, bgRainMist);
+      rp.draw(3);
+    }
     rp.end();
 
     for (let m = 0; m < BLOOM_LEVELS; m++) {
