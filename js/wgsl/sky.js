@@ -1,6 +1,8 @@
 // Physically based atmosphere (Hillaire 2020 style LUTs), aerial-perspective volume,
 // procedural cloud deck and the cloud shadows it casts on the ground.
 import { FRAME_WGSL, ATMO_CORE_WGSL, NOISE_WGSL, SKY_W, SKY_H, AP_RES, AP_MAX_KM } from './common.js';
+import { clipSampleWGSL } from './terrain.js';
+import { RAIN_STRUCT, RAIN_FUNCS } from './rain.js';
 
 const ATMO_UNIFORM = /* wgsl */ `
 struct AtmoP { haze: vec4f };   // x = mie multiplier
@@ -225,6 +227,14 @@ fn skyViewUV(dir: vec3f) -> vec2f {
 
 fn skyAtmo(dir: vec3f) -> vec3f {
   return textureSampleLevel(skyLUT, sampC, skyViewUV(dir), 0.0).rgb * F.sunDir.w;
+}
+
+// Hemisphere lookup shared with the reflection bake. u wraps at the azimuth cut.
+fn skyMapUV(dir: vec3f) -> vec2f {
+  let d = normalize(dir);
+  let az = atan2(d.x, -d.z);
+  let el = asin(clamp(d.y, 0.0, 1.0));
+  return vec2f(az * (0.5 / PI) + 0.5, el * (2.0 / PI));
 }
 `;
 
@@ -484,9 +494,9 @@ fn cloudLayers(dir: vec3f, pixAng: f32, aa: vec2f, sunT: ptr<function, f32>) -> 
       let e = lowEdge(h.q, fp, 7);
       let d = clamp(e / lowSoft(fp), 0.0, 1.0) * far;
       if (d > 0.002) {
-        let s1 = lowDensity(h.q + sxz * 0.08, fp, 5) * far;
-        let s2 = lowDensity(h.q + sxz * 0.25, fp, 4) * far;
-        let s3 = lowDensity(h.q + sxz * 0.6, fp, 3) * far;
+        let s1 = lowDensity(h.q + sxz * 0.08, fp, 4) * far;
+        let s2 = lowDensity(h.q + sxz * 0.25, fp, 3) * far;
+        let s3 = lowDensity(h.q + sxz * 0.6, fp, 2) * far;
         lo = shadeLayer(dir, h, hc, d, s1, s2, s3, F.cloudLight.x, 0.75);
         // opacity saturates within a sliver of the density ramp, making a hard silhouette:
         // spread it over ~1.5 pixels
@@ -507,8 +517,8 @@ fn cloudLayers(dir: vec3f, pixAng: f32, aa: vec2f, sunT: ptr<function, f32>) -> 
       let e = highEdge(h.q, fp, 6);
       let d = clamp(e / highSoft(fp), 0.0, 1.0) * far;
       if (d > 0.002) {
-        let s1 = highDensity(h.q + sxz * 0.15, fp, 4) * far;
-        let s2 = highDensity(h.q + sxz * 0.5, fp, 3) * far;
+        let s1 = highDensity(h.q + sxz * 0.15, fp, 3) * far;
+        let s2 = highDensity(h.q + sxz * 0.5, fp, 2) * far;
         hi = shadeLayer(dir, h, hc, d, s1, s2, s2, F.cloudLight.y, 0.80);
         let aw = select(fp * 0.2 * 2.5, aa.y, aa.y >= 0.0) * F.cloudShape.z;
         hi *= smoothstep(0.0, aw * 1.5 + 1e-6, e);
@@ -794,4 +804,70 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   }
 }
 `;
+
+// Ground cloud-shadow map and the sky hemisphere sampled by water. Both used to be
+// evaluated inside the landscape shader, once per pixel. A few hundred texels of the
+// real cloud function is enough: shadows are soft, and ripples blur the reflection.
+export const SHADOW_N = 384;
+export const SHADOW_SPAN = 20000;
+export const REFL_W = 256;
+export const REFL_H = 96;
+
+const SKY_BAKE_BINDINGS = /* wgsl */ `
+@group(0) @binding(0) var<uniform> F: Frame;
+@group(0) @binding(1) var transLUT: texture_2d<f32>;
+@group(0) @binding(2) var skyLUT: texture_2d<f32>;
+@group(0) @binding(3) var sampC: sampler;
+@group(0) @binding(4) var starMap: texture_2d<f32>;
+`;
+
+export function cloudShadowBakeWGSL(filterA) {
+  return FRAME_WGSL + ATMO_CORE_WGSL + SKY_BAKE_BINDINGS + /* wgsl */ `
+@group(0) @binding(5) var clipA: texture_2d_array<f32>;
+@group(0) @binding(6) var clipB: texture_2d_array<f32>;
+@group(0) @binding(7) var<uniform> CL: ClipLevels;
+struct ShadowBake { origin: vec2f, texel: f32, span: f32 };
+@group(0) @binding(8) var<uniform> S: ShadowBake;
+@group(0) @binding(9) var dst: texture_storage_2d<rgba16float, write>;
+` + RAIN_STRUCT + /* wgsl */ `
+@group(0) @binding(10) var<uniform> Rain: RainU;
+` + SKY_RENDER_FUNCS + SKY_CLOUD_FUNCS + RAIN_FUNCS + clipSampleWGSL(filterA) + /* wgsl */ `
+@compute @workgroup_size(8, 8, 1)
+fn main(@builtin(global_invocation_id) id: vec3u) {
+  if (id.x >= ${SHADOW_N}u || id.y >= ${SHADOW_N}u) { return; }
+  let xz = S.origin + (vec2f(id.xy) + 0.5) * S.texel;
+  let lv = clamp(clipFinest(xz), 0.0, f32(CLIP_L - 1));
+  let h = clipHeight(xz, lv);
+  var sh = cloudShadowAt(vec3f(xz.x, h, xz.y));
+  // The included sky code names these resources. Touch them so the bind-group
+  // layout still has every binding after unused functions are stripped.
+  if (Rain.wind.w < -1e9) {
+    sh += textureSampleLevel(transLUT, sampC, vec2f(0.5), 0.0).r;
+    sh += textureSampleLevel(skyLUT, sampC, vec2f(0.5), 0.0).r;
+    sh += textureLoad(starMap, vec2i(0), 0).r;
+    sh += clipB1(xz, 0).x;
+  }
+  textureStore(dst, id.xy, vec4f(sh, 0.0, 0.0, 1.0));
+}
+`;
+}
+
+export function skyReflectBakeWGSL() {
+  return FRAME_WGSL + ATMO_CORE_WGSL + SKY_BAKE_BINDINGS + RAIN_STRUCT + /* wgsl */ `
+@group(0) @binding(5) var<uniform> Rain: RainU;
+@group(0) @binding(6) var dst: texture_storage_2d<rgba16float, write>;
+` + SKY_RENDER_FUNCS + SKY_CLOUD_FUNCS + RAIN_FUNCS + /* wgsl */ `
+@compute @workgroup_size(8, 8, 1)
+fn main(@builtin(global_invocation_id) id: vec3u) {
+  if (id.x >= ${REFL_W}u || id.y >= ${REFL_H}u) { return; }
+  let uv = (vec2f(id.xy) + 0.5) / vec2f(${REFL_W}.0, ${REFL_H}.0);
+  let az = (uv.x * 2.0 - 1.0) * PI;
+  let el = uv.y * (PI * 0.5);
+  let ce = cos(el);
+  let dir = vec3f(sin(az) * ce, sin(el), -cos(az) * ce);
+  let pix = (PI * 0.5) / ${REFL_H}.0;
+  textureStore(dst, id.xy, vec4f(skyRadiance(dir, false, pix), 1.0));
+}
+`;
+}
 

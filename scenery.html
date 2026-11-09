@@ -383,6 +383,8 @@ fn gnoise(p: vec2f) -> f32 {
 // Physically based atmosphere (Hillaire 2020 style LUTs), aerial-perspective volume,
 // procedural cloud deck and the cloud shadows it casts on the ground.
 
+
+
 const ATMO_UNIFORM = /* wgsl */ `
 struct AtmoP { haze: vec4f };   // x = mie multiplier
 @group(0) @binding(0) var<uniform> A: AtmoP;
@@ -606,6 +608,14 @@ fn skyViewUV(dir: vec3f) -> vec2f {
 
 fn skyAtmo(dir: vec3f) -> vec3f {
   return textureSampleLevel(skyLUT, sampC, skyViewUV(dir), 0.0).rgb * F.sunDir.w;
+}
+
+// Hemisphere lookup shared with the reflection bake. u wraps at the azimuth cut.
+fn skyMapUV(dir: vec3f) -> vec2f {
+  let d = normalize(dir);
+  let az = atan2(d.x, -d.z);
+  let el = asin(clamp(d.y, 0.0, 1.0));
+  return vec2f(az * (0.5 / PI) + 0.5, el * (2.0 / PI));
 }
 `;
 
@@ -865,9 +875,9 @@ fn cloudLayers(dir: vec3f, pixAng: f32, aa: vec2f, sunT: ptr<function, f32>) -> 
       let e = lowEdge(h.q, fp, 7);
       let d = clamp(e / lowSoft(fp), 0.0, 1.0) * far;
       if (d > 0.002) {
-        let s1 = lowDensity(h.q + sxz * 0.08, fp, 5) * far;
-        let s2 = lowDensity(h.q + sxz * 0.25, fp, 4) * far;
-        let s3 = lowDensity(h.q + sxz * 0.6, fp, 3) * far;
+        let s1 = lowDensity(h.q + sxz * 0.08, fp, 4) * far;
+        let s2 = lowDensity(h.q + sxz * 0.25, fp, 3) * far;
+        let s3 = lowDensity(h.q + sxz * 0.6, fp, 2) * far;
         lo = shadeLayer(dir, h, hc, d, s1, s2, s3, F.cloudLight.x, 0.75);
         // opacity saturates within a sliver of the density ramp, making a hard silhouette:
         // spread it over ~1.5 pixels
@@ -888,8 +898,8 @@ fn cloudLayers(dir: vec3f, pixAng: f32, aa: vec2f, sunT: ptr<function, f32>) -> 
       let e = highEdge(h.q, fp, 6);
       let d = clamp(e / highSoft(fp), 0.0, 1.0) * far;
       if (d > 0.002) {
-        let s1 = highDensity(h.q + sxz * 0.15, fp, 4) * far;
-        let s2 = highDensity(h.q + sxz * 0.5, fp, 3) * far;
+        let s1 = highDensity(h.q + sxz * 0.15, fp, 3) * far;
+        let s2 = highDensity(h.q + sxz * 0.5, fp, 2) * far;
         hi = shadeLayer(dir, h, hc, d, s1, s2, s2, F.cloudLight.y, 0.80);
         let aw = select(fp * 0.2 * 2.5, aa.y, aa.y >= 0.0) * F.cloudShape.z;
         hi *= smoothstep(0.0, aw * 1.5 + 1e-6, e);
@@ -1175,6 +1185,72 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   }
 }
 `;
+
+// Ground cloud-shadow map and the sky hemisphere sampled by water. Both used to be
+// evaluated inside the landscape shader, once per pixel. A few hundred texels of the
+// real cloud function is enough: shadows are soft, and ripples blur the reflection.
+const SHADOW_N = 384;
+const SHADOW_SPAN = 20000;
+const REFL_W = 256;
+const REFL_H = 96;
+
+const SKY_BAKE_BINDINGS = /* wgsl */ `
+@group(0) @binding(0) var<uniform> F: Frame;
+@group(0) @binding(1) var transLUT: texture_2d<f32>;
+@group(0) @binding(2) var skyLUT: texture_2d<f32>;
+@group(0) @binding(3) var sampC: sampler;
+@group(0) @binding(4) var starMap: texture_2d<f32>;
+`;
+
+function cloudShadowBakeWGSL(filterA) {
+  return FRAME_WGSL + ATMO_CORE_WGSL + SKY_BAKE_BINDINGS + /* wgsl */ `
+@group(0) @binding(5) var clipA: texture_2d_array<f32>;
+@group(0) @binding(6) var clipB: texture_2d_array<f32>;
+@group(0) @binding(7) var<uniform> CL: ClipLevels;
+struct ShadowBake { origin: vec2f, texel: f32, span: f32 };
+@group(0) @binding(8) var<uniform> S: ShadowBake;
+@group(0) @binding(9) var dst: texture_storage_2d<rgba16float, write>;
+` + RAIN_STRUCT + /* wgsl */ `
+@group(0) @binding(10) var<uniform> Rain: RainU;
+` + SKY_RENDER_FUNCS + SKY_CLOUD_FUNCS + RAIN_FUNCS + clipSampleWGSL(filterA) + /* wgsl */ `
+@compute @workgroup_size(8, 8, 1)
+fn main(@builtin(global_invocation_id) id: vec3u) {
+  if (id.x >= ${SHADOW_N}u || id.y >= ${SHADOW_N}u) { return; }
+  let xz = S.origin + (vec2f(id.xy) + 0.5) * S.texel;
+  let lv = clamp(clipFinest(xz), 0.0, f32(CLIP_L - 1));
+  let h = clipHeight(xz, lv);
+  var sh = cloudShadowAt(vec3f(xz.x, h, xz.y));
+  // The included sky code names these resources. Touch them so the bind-group
+  // layout still has every binding after unused functions are stripped.
+  if (Rain.wind.w < -1e9) {
+    sh += textureSampleLevel(transLUT, sampC, vec2f(0.5), 0.0).r;
+    sh += textureSampleLevel(skyLUT, sampC, vec2f(0.5), 0.0).r;
+    sh += textureLoad(starMap, vec2i(0), 0).r;
+    sh += clipB1(xz, 0).x;
+  }
+  textureStore(dst, id.xy, vec4f(sh, 0.0, 0.0, 1.0));
+}
+`;
+}
+
+function skyReflectBakeWGSL() {
+  return FRAME_WGSL + ATMO_CORE_WGSL + SKY_BAKE_BINDINGS + RAIN_STRUCT + /* wgsl */ `
+@group(0) @binding(5) var<uniform> Rain: RainU;
+@group(0) @binding(6) var dst: texture_storage_2d<rgba16float, write>;
+` + SKY_RENDER_FUNCS + SKY_CLOUD_FUNCS + RAIN_FUNCS + /* wgsl */ `
+@compute @workgroup_size(8, 8, 1)
+fn main(@builtin(global_invocation_id) id: vec3u) {
+  if (id.x >= ${REFL_W}u || id.y >= ${REFL_H}u) { return; }
+  let uv = (vec2f(id.xy) + 0.5) / vec2f(${REFL_W}.0, ${REFL_H}.0);
+  let az = (uv.x * 2.0 - 1.0) * PI;
+  let el = uv.y * (PI * 0.5);
+  let ce = cos(el);
+  let dir = vec3f(sin(az) * ce, sin(el), -cos(az) * ce);
+  let pix = (PI * 0.5) / ${REFL_H}.0;
+  textureStore(dst, id.xy, vec4f(skyRadiance(dir, false, pix), 1.0));
+}
+`;
+}
 
 
 // ---- js/wgsl/terrain.js ----
@@ -1723,29 +1799,35 @@ fn canopyAt(p: vec2f, sampleMasks: bool, dens0: f32, conif0: f32) -> Canopy {
   return best;
 }
 
-// Fraction of sunlight reaching a point y0 metres above the ground at p, marched through
-// the neighbouring crowns. Crowns pass a little light (porosity). Past the end of the march
-// a ray that is still well inside the canopy layer counts as blocked by the stand density.
-fn canopyShadow(p: vec2f, y0: f32, L: vec3f, dens: f32, conif: f32, groundGrad: vec2f) -> f32 {
+// Fraction of sunlight reaching a point y0 metres above the ground at p.
+// A closed stand shades its own floor from density alone. Individual neighbour crowns
+// are marched only while they cover more than a couple of pixels — the old 9-step
+// march ran on most of an aerial frame and was the bulk of the GPU cost.
+fn canopyShadow(p: vec2f, y0: f32, L: vec3f, dens: f32, conif: f32, groundGrad: vec2f, fp: f32) -> f32 {
   let lh = length(L.xz);
   if (lh < 1e-3 || dens < 0.004) { return 1.0; }
-  let dir = L.xz / lh;
-  let rise = L.y / lh - dot(groundGrad, dir);
-  let topMax = F.forest.z * 1.5;
-  let stepL = F.forest.y * 0.45;
-  var t = stepL * 0.6;
-  var occ = 0.0;
-  for (var i = 0; i < 9; i++) {
-    let ry = y0 + t * rise;
-    if (ry > topMax) { return 1.0 - occ; }
-    let c = canopyAt(p + dir * t, false, dens, conif);
-    if (c.hit) { occ = max(occ, smoothstep(-0.4, 1.4, c.y - ry) * 0.88); }
-    if (occ > 0.87) { return 1.0 - occ; }
-    t += stepL;
+  let top = max(F.forest.z, 1.0);
+  let sunk = smoothstep(-0.02, 0.35, L.y);
+  let depth = smoothstep(top * 0.95, top * 0.2, y0) * smoothstep(0.05, 0.5, dens);
+  var occ = depth * mix(0.78, 0.34, sunk);
+  let sp = F.forest.y;
+  if (fp < sp * 0.5) {
+    let dir = L.xz / lh;
+    let rise = L.y / lh - dot(groundGrad, dir);
+    let stepL = sp * 0.85;
+    var t = stepL * 0.5;
+    let limit = select(3, 2, fp > sp * 0.22);
+    for (var i = 0; i < 3; i++) {
+      if (i >= limit) { break; }
+      let ry = y0 + t * rise;
+      if (ry > top * 1.4) { break; }
+      let c = canopyAt(p + dir * t, false, dens, conif);
+      if (c.hit) { occ = max(occ, smoothstep(-0.3, 1.15, c.y - ry) * 0.9); }
+      if (occ > 0.86) { break; }
+      t += stepL;
+    }
   }
-  let ry = y0 + t * rise;
-  let deep = (1.0 - smoothstep(0.3, 0.95, ry / max(F.forest.z, 1.0))) * smoothstep(0.05, 0.6, dens);
-  return 1.0 - max(occ, deep * 0.82);
+  return clamp(1.0 - occ, 0.0, 1.0);
 }
 
 // ---- foliage colour (linear albedo) ------------------------------------------------
@@ -2121,14 +2203,23 @@ struct VO { @builtin(position) pos: vec4f, @location(0) ndc: vec2f };
 `;
 
 function landWGSL(filterA) {
-  return FRAME_WGSL + ATMO_CORE_WGSL + RENDER_BINDINGS + /* wgsl */ `
-@group(0) @binding(5) var apTex: texture_3d<f32>;
-@group(0) @binding(6) var clipA: texture_2d_array<f32>;
-@group(0) @binding(7) var clipB: texture_2d_array<f32>;
-@group(0) @binding(8) var<uniform> CL: ClipLevels;
+  return FRAME_WGSL + ATMO_CORE_WGSL + /* wgsl */ `
+@group(0) @binding(0) var<uniform> F: Frame;
+@group(0) @binding(1) var transLUT: texture_2d<f32>;
+@group(0) @binding(2) var skyLUT: texture_2d<f32>;
+@group(0) @binding(3) var sampC: sampler;
+@group(0) @binding(4) var apTex: texture_3d<f32>;
+@group(0) @binding(5) var clipA: texture_2d_array<f32>;
+@group(0) @binding(6) var clipB: texture_2d_array<f32>;
+@group(0) @binding(7) var<uniform> CL: ClipLevels;
 ` + RAIN_STRUCT + /* wgsl */ `
-@group(0) @binding(9) var<uniform> Rain: RainU;
-` + SKY_RENDER_FUNCS + SKY_CLOUD_FUNCS + RAIN_FUNCS + TERRAIN_FUNCS + clipSampleWGSL(filterA) + FOREST_FUNCS + /* wgsl */ `
+@group(0) @binding(8) var<uniform> Rain: RainU;
+struct ShadowMap { origin: vec2f, texel: f32, span: f32 };
+@group(0) @binding(9) var cloudShadowTex: texture_2d<f32>;
+@group(0) @binding(10) var<uniform> SH: ShadowMap;
+@group(0) @binding(11) var reflTex: texture_2d<f32>;
+@group(0) @binding(12) var sampR: sampler;
+` + SKY_RENDER_FUNCS + RAIN_FUNCS + TERRAIN_FUNCS + clipSampleWGSL(filterA) + FOREST_FUNCS + /* wgsl */ `
 const AP_N: f32 = ${AP_RES}.0;
 const AP_MAX: f32 = ${AP_MAX_KM}.0;
 const EARTH_R: f32 = 6371000.0;
@@ -2144,7 +2235,10 @@ struct VSOut {
 fn meshCanopy(xz: vec2f, dens: f32, eff: f32) -> f32 {
   let sp = F.forest.y;
   let mean = dens * F.forest.z * 0.62;
-  let kNear = 1.0 - smoothstep(0.55 * sp, 1.15 * sp, eff);
+  // Only the finest grid builds individual crowns. A 2 m vertex is already smaller
+  // than the canopy detail the fragment can show from the air, and evaluating a
+  // crown at every coarser vertex was most of the vertex cost.
+  let kNear = 1.0 - smoothstep(0.9, 1.8, eff);
   if (kNear <= 0.0) { return mean; }
   let c = canopyAt(xz, true, 0.0, 0.0);
   return mix(mean, max(c.y, understoryH(dens)), kNear);
@@ -2190,24 +2284,37 @@ fn moonIlluminance() -> vec3f {
   return vec3f(1.0, 0.96, 0.9) * sampleTrans(camR(), moon.y) * E;
 }
 
-// Mountain shadows: march the height clipmaps towards the sun with growing steps.
+// Mountain shadows: a short march for the nearest ridge, then long steps that still
+// reach a few kilometres. The shadow only has to catch whole slopes, so samples stay
+// on coarse clip levels instead of the 2 m map.
 fn terrainShadow(p: vec3f, L: vec3f) -> f32 {
   if (L.y > 0.8) { return 1.0; }
   let ceiling = waterLevel(p.z) + F.valley.w + F.relief.x * (1.5 - F.biome.z) + 40.0;
-  var t = 6.0;
+  var t = 20.0;
   var res = 1.0;
-  for (var i = 0; i < 26; i++) {
+  for (var i = 0; i < 12; i++) {
     let q = p + L * t;
     if (q.y > ceiling) { break; }
-    // coarser levels for the far part of the ray: it only needs to see whole ridges
-    let lf = clamp(max(clipFinest(q.xz), log2(t * 0.04 / CLIP_T0)), 0.0, f32(CLIP_L - 1));
+    let texel = max(t * 0.15, 20.0);
+    let lf = clamp(max(clipFinest(q.xz), log2(texel / CLIP_T0)), 0.0, f32(CLIP_L - 1));
     let h = clipHeight(q.xz, ceil(lf));
     let gap = q.y - h;
-    res = min(res, gap / (t * 0.035) + 0.5);
+    res = min(res, gap / (t * 0.05) + 0.5);
     if (res <= 0.0) { return 0.0; }
-    t *= 1.32;
+    t *= select(1.42, 1.7, i >= 4);
   }
   return smoothstep(0.0, 1.0, res);
+}
+
+// Cloud shadow baked for the ground around the camera. Same shapes as the sky,
+// sampled once per frame instead of rebuilt inside every landscape pixel.
+fn cloudShade(world: vec3f) -> f32 {
+  if (F.cloudP.w <= 0.001 || F.sunDir.y <= 0.0) { return 1.0; }
+  let uv = (world.xz - SH.origin) / SH.span;
+  let edge = smoothstep(0.0, 0.03, uv.x) * smoothstep(0.0, 0.03, uv.y)
+           * smoothstep(0.0, 0.03, 1.0 - uv.x) * smoothstep(0.0, 0.03, 1.0 - uv.y);
+  let s = textureSampleLevel(cloudShadowTex, sampC, clamp(uv, vec2f(0.001), vec2f(0.999)), 0.0).r;
+  return mix(1.0, s, edge);
 }
 
 fn ggx(nh: f32, a: f32) -> f32 {
@@ -2234,7 +2341,7 @@ fn direct(lt: Light, n: vec3f, sunVis: f32) -> vec3f {
 
 // Ground cover between and outside the trees.
 fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32, curv: f32) -> vec3f {
-  let n1 = fbm2(xz * (1.0 / 45.0) + vec2f(2.0, 9.0), 3);
+  let n1 = fbm2(xz * (1.0 / 45.0) + vec2f(2.0, 9.0), select(3, 2, fp > 3.0));
   let n2 = snoise(xz * (1.0 / 9.0) + vec2f(5.0, 1.0)) * (1.0 - smoothstep(2.0, 9.0, fp));
   let dry = F.forest2.x * 0.6 + smoothstep(-0.2, 0.4, n1) * 0.22;
   let trop = F.biome.w;
@@ -2261,6 +2368,7 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
     c = mix(c, sand, beach);
   }
   // rock: granite greys (dark basalt in the tropics), darker in clefts, lighter on ribs
+  if (rock > 0.02) {
   let strata = snoise(vec2f((xz.x + xz.y) * 0.004, above * 0.09)) * 0.5 + 0.5;
   var rk = mix(vec3f(0.12, 0.115, 0.10), vec3f(0.19, 0.18, 0.16), strata);
   // weathered faces carry lichen and moss
@@ -2275,6 +2383,7 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
   rk *= clamp(1.0 + curv * 5.0, 0.55, 1.25) * (0.85 + 0.3 * n2);
   if (F.water.w > 0.5) { rk = mix(rk, rk * vec3f(1.25, 0.92, 0.72), 0.55); }
   c = mix(c, rk, rock);
+  }
   // lichen and scree tint above the treeline
   c = mix(c, vec3f(0.85, 0.87, 0.9), snow);
   return c;
@@ -2285,7 +2394,6 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
   let dist = length(in.rel);
   let V = -in.rel / dist;
   let fp = max(length(dpdx(xz)), length(dpdy(xz)));
-  let pixAng = 2.0 * length(F.camUp.xyz) * F.screen.w;
 
   let lc = clipFinest(xz);
   let lf = clamp(max(lc, log2(max(fp, 1e-3) / CLIP_T0) - 0.5), 0.0, f32(CLIP_L - 1));
@@ -2310,7 +2418,7 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
   var sunVis = 0.0;
   var cloudSh = 1.0;
   if (sunUp > 0.0) {
-    cloudSh = cloudShadowAt(ground);
+    cloudSh = cloudShade(ground);
     sunVis = terrainShadow(ground + Nt * 2.0, lt.L) * cloudSh * sunUp;
   }
   lt.sun = sampleTrans(RG + ground.y * 0.001, lt.L.y) * F.sunDir.w;
@@ -2356,7 +2464,7 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
     let Fr = schlick(NdV, 0.02);
     var R = reflect(-V, n);
     R.y = abs(R.y);
-    var refl = skyRadiance(R, false, pixAng);
+    var refl = textureSampleLevel(reflTex, sampR, skyMapUV(R), 0.0).rgb;
     // the wooded banks darken the reflection near the shore
     let bankK = (1.0 - smoothstep(0.2, 3.5, depth)) * smoothstep(0.0, 0.4, 1.0 - R.y);
     let bankCol = standAlbedo(0.5) * (lt.sun * sunVis * 0.25 + ambient(lt, Nt)) * (0.9 / PI);
@@ -2391,7 +2499,9 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
   } else {
     // ---- land ----
     let sp = F.forest.y;
-    let farK = smoothstep(0.4 * sp, 1.15 * sp, fp);
+    // Individual crowns while they still read as a canopy. The fade used to wait until
+    // a crown was under a pixel, which kept the expensive path on the whole view.
+    let farK = smoothstep(0.38 * sp, 1.05 * sp, fp);
     let gAlb = groundAlbedo(xz, fp, above, dens, M.z, M.w, curv);
     // bumpy ground normal near the camera
     var Ng = Nt;
@@ -2404,7 +2514,9 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
     var crown: Canopy;
     crown.hit = false;
     let wantCrown = F.forest.x > 0.0 && dens > 0.02 && farK < 1.0;
-    if (wantCrown) { crown = canopyAt(xz, true, 0.0, 0.0); }
+    // The stand mask at this pixel is enough once a crown is only a few pixels wide.
+    // Per-trunk mask lookups are kept for the foreground, where a clearing edge is visible.
+    if (wantCrown) { crown = canopyAt(xz, fp < 0.9, dens, conif); }
     var nearC = vec3f(0.0);
     if (farK < 1.0 && F.forest.x > 0.0) {
       let c = crown;
@@ -2430,7 +2542,7 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
         // deeper crown layers and the clefts between clusters see less sky
         let depthK = clamp((yb - t.base) / max(t.top - t.base, 1.0), 0.0, 1.0);
         let ao = (0.45 + 0.55 * depthK) * clamp(1.0 + (b1.x + 0.5 * b2.x) * 0.8 * kd, 0.5, 1.2) * aoT;
-        let sh = canopyShadow(xz, yb, lt.L, dens, conif, grad);
+        let sh = canopyShadow(xz, yb, lt.L, dens, conif, grad, fp);
         let alb = treeAlbedo(t);
         // foliage scatters forward: some sun comes through thin, backlit crown edges
         let trans = select(0.35, 0.18, t.conifer) * max(-dot(nC, lt.L), 0.0) * (1.0 - depthK * 0.6);
@@ -2441,7 +2553,7 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
         nearC = alb * (direct(lt, nC, sh * sunVis) + lt.sun * sh * sunVis * trans + ambient(lt, nC) * ao)
              + lt.sun * sh * sunVis * spec * PI;  // undone by the 1/pi applied to all land below
       } else {
-        let sh = canopyShadow(xz, uy, lt.L, dens, conif, grad);
+        let sh = canopyShadow(xz, uy, lt.L, dens, conif, grad, fp);
         // under and between crowns: little sky reaches the floor or the understory
         let ao = mix(1.0, 0.28, smoothstep(0.0, 0.8, dens)) * aoT;
         let uK = smoothstep(0.5, 2.0, uy);
@@ -2628,7 +2740,7 @@ fn tap(uv: vec2f) -> vec3f { return textureSampleLevel(src, samp, uv, 0.0).rgb; 
 `;
 
 const COMPOSITE = FS_TRI + /* wgsl */ `
-struct P { p: vec4f, q: vec4f };  // p: exposure, bloom, frame, vignette; q: saturation, contrast, warmth, grain
+struct P { p: vec4f, q: vec4f };  // p: exposure, bloom, frame, vignette; q: saturation, contrast, warmth, sharpen
 @group(0) @binding(0) var hdr: texture_2d<f32>;
 @group(0) @binding(1) var bloom: texture_2d<f32>;
 @group(0) @binding(2) var samp: sampler;
@@ -2667,6 +2779,17 @@ fn ign(p: vec2f) -> f32 { return fract(52.9829189 * fract(dot(p, vec2f(0.0671105
   let dims = vec2f(textureDimensions(hdr));
   let pc = vec2i(in.pos.xy);
   var c = textureLoad(hdr, pc, 0).rgb;
+  // Mild sharpen when the picture is drawn below the display size and the browser scales it up.
+  if (U.q.w > 0.001) {
+    let d = vec2i(dims);
+    let blur = (
+      textureLoad(hdr, clamp(pc + vec2i(1, 0), vec2i(0), d - 1), 0).rgb +
+      textureLoad(hdr, clamp(pc + vec2i(-1, 0), vec2i(0), d - 1), 0).rgb +
+      textureLoad(hdr, clamp(pc + vec2i(0, 1), vec2i(0), d - 1), 0).rgb +
+      textureLoad(hdr, clamp(pc + vec2i(0, -1), vec2i(0), d - 1), 0).rgb
+    ) * 0.25;
+    c += (c - blur) * U.q.w;
+  }
   // the up-chain accumulates 8 blur levels
   let b = textureSampleLevel(bloom, samp, in.uv, 0.0).rgb * (1.0 / 8.0);
   c = mix(c, b, U.p.y);
@@ -4067,15 +4190,17 @@ async function main() {
   // --------------------------------------------------------------------------------------
   // Render pipelines
   // --------------------------------------------------------------------------------------
-  const MSAA = 4;
+  const MSAA = 1;
   const HDR = 'rgba16float';
-  const [landMod, skyMod, downMod, upMod, compMod, rainInitPipe, rainDropPipe, rainDrawMod, rainMistMod] = await Promise.all([
+  const [landMod, skyMod, downMod, upMod, compMod, rainInitPipe, rainDropPipe, rainDrawMod, rainMistMod, shadowPipe, reflPipe] = await Promise.all([
     shader(landWGSL(hasF32Filter), 'land'), shader(SKY_BG, 'sky'), shader(BLOOM_DOWN, 'bloom down'),
     shader(BLOOM_UP, 'bloom up'), shader(COMPOSITE, 'composite'),
     computePipe(RAIN_DROP_INIT, 'rain init'),
     computePipe(RAIN_DROP_UPDATE, 'rain drops'),
     shader(RAIN_DRAW, 'rain draw'),
     shader(RAIN_MIST, 'rain mist'),
+    computePipe(cloudShadowBakeWGSL(hasF32Filter), 'cloud shadow'),
+    computePipe(skyReflectBakeWGSL(), 'sky reflect'),
   ]);
   const PREMUL = {
     color: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
@@ -4143,8 +4268,33 @@ async function main() {
     fragment: { module: compMod, entryPoint: 'fs', targets: [{ format: swapFormat }] },
   });
 
-  const bgLand = bg(landPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp, starView, apView,
-    arr(clipA), arr(clipB), { buffer: clipUBO }, { buffer: rainUBO }], 'land');
+  const shadowTex = device.createTexture({
+    label: 'cloud shadow', size: [SHADOW_N, SHADOW_N], format: HDR,
+    usage: TU.STORAGE_BINDING | TU.TEXTURE_BINDING,
+  });
+  const shadowView = shadowTex.createView();
+  const shadowUBO = mkBuf(16, GU.UNIFORM | GU.COPY_DST, 'shadow map');
+  const shadowF = new Float32Array(4);
+  const reflTex = device.createTexture({
+    label: 'sky reflect', size: [REFL_W, REFL_H], format: HDR,
+    usage: TU.STORAGE_BINDING | TU.TEXTURE_BINDING,
+  });
+  const reflView = reflTex.createView();
+  const reflSamp = device.createSampler({
+    magFilter: 'linear', minFilter: 'linear',
+    addressModeU: 'repeat', addressModeV: 'clamp-to-edge',
+  });
+  const bgShadow = bg(shadowPipe, [
+    { buffer: frameUBO }, transView, skyView, sampClamp, starView,
+    arr(clipA), arr(clipB), { buffer: clipUBO }, { buffer: shadowUBO }, shadowView, { buffer: rainUBO },
+  ], 'cloud shadow');
+  const bgRefl = bg(reflPipe, [
+    { buffer: frameUBO }, transView, skyView, sampClamp, starView, { buffer: rainUBO }, reflView,
+  ], 'sky reflect');
+
+  const bgLand = bg(landPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp, apView,
+    arr(clipA), arr(clipB), { buffer: clipUBO }, { buffer: rainUBO },
+    shadowView, { buffer: shadowUBO }, reflView, reflSamp], 'land');
   const bgSky = bg(skyPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp, starView, { buffer: rainUBO }], 'sky');
   const bgRainInit = bg(rainInitPipe, [{ buffer: rainUBO }, { buffer: dropBuf }], 'rain init');
   const bgRainDrop = bg(rainDropPipe, [{ buffer: rainUBO }, { buffer: frameUBO }, { buffer: dropBuf }], 'rain drop');
@@ -4185,13 +4335,16 @@ async function main() {
   for (let i = 0; i < BLOOM_LEVELS * 2; i++) bloomUBOs.push(mkBuf(16, GU.UNIFORM | GU.COPY_DST, 'bloom ubo'));
 
   let W = 0, H = 0;
-  // A frame that runs past one refresh is shown twice, so the flight appears to stutter.
-  // paceScale eases the drawing resolution down just enough to fit, then back up when the
-  // GPU has room. It never goes above the Render scale setting.
+  // A picture frame should finish the frame and let the GPU sleep. Shading this landscape
+  // at a native 4K framebuffer is what pinned a strong card at 30 fps. The drawing target
+  // stays within a 1440p budget (the Render scale slider still reaches 4K at 1.5), and
+  // paceScale eases it further if a frame still runs long, then back up when there is room.
+  const RENDER_PIXELS = 2560 * 1440;
   let paceScale = 1;
   let paceHold = 0;
   let paceSeen = 0;
   let paceFresh = 0;
+  let presentSharpen = 0;
   function considerPace(dt) {
     if (!hasTS || gpuMs <= 0 || shotName) return;
     // The first frames bake every terrain level at once, so the early GPU time is not
@@ -4199,13 +4352,16 @@ async function main() {
     paceSeen += dt;
     if (paceSeen < 2.5) return;
     paceHold += dt;
-    if (paceHold < 1.2) return;
+    if (paceHold < 0.8) return;
     paceHold = 0;
     let next = paceScale;
-    if (gpuMs > 15.5) next = paceScale * Math.sqrt(14.5 / gpuMs);
-    else if (gpuMs < 12 && paceScale < 1) next = Math.min(1, paceScale * Math.sqrt(13 / gpuMs));
-    next = Math.max(paceScale - 0.15, Math.min(paceScale + 0.1, next));
-    next = Math.max(0.6, Math.min(1, Math.round(next * 20) / 20));
+    // Aim under ~9 ms so a 60 Hz display still has idle time. Filling the whole refresh
+    // is what made the fans spin like a stress test.
+    if (gpuMs > 11) next = paceScale * Math.sqrt(9 / gpuMs);
+    else if (gpuMs < 7.5 && paceScale < 1) next = Math.min(1, paceScale * Math.sqrt(8.5 / gpuMs));
+    const stepDown = gpuMs > 20 ? 0.25 : 0.12;
+    next = Math.max(paceScale - stepDown, Math.min(paceScale + 0.08, next));
+    next = Math.max(0.5, Math.min(1, Math.round(next * 20) / 20));
     if (next === paceScale) return;
     paceScale = next;
     // The running average was measured at the old resolution. Ignore it, and the
@@ -4227,22 +4383,52 @@ async function main() {
 
   function resize() {
     const fw = Number(qs.get('w')) || 0, fh = Number(qs.get('h')) || 0;
-    const dpr = (window.devicePixelRatio || 1) * P.renderScale * paceScale;
-    const w = fw || Math.max(1, Math.round(canvas.clientWidth * dpr));
-    const h = fh || Math.max(1, Math.round(canvas.clientHeight * dpr));
+    const dpr = window.devicePixelRatio || 1;
+    let w, h, sharpen = 0;
+    if (fw && fh) {
+      w = fw;
+      h = fh;
+    } else {
+      const cssW = Math.max(1, canvas.clientWidth);
+      const cssH = Math.max(1, canvas.clientHeight);
+      const scale = dpr * P.renderScale * paceScale;
+      w = cssW * scale;
+      h = cssH * scale;
+      const budget = RENDER_PIXELS * P.renderScale * P.renderScale * paceScale * paceScale;
+      const pixels = w * h;
+      if (pixels > budget) {
+        const s = Math.sqrt(budget / pixels);
+        w *= s;
+        h *= s;
+      }
+      const native = cssW * cssH * dpr * dpr;
+      const drawn = Math.max(1, w * h);
+      if (native > drawn * 1.08) sharpen = Math.min(0.42, (Math.sqrt(native / drawn) - 1) * 0.55);
+    }
+    w = Math.max(1, Math.round(w));
+    h = Math.max(1, Math.round(h));
+    presentSharpen = sharpen;
     if (w === W && h === H) return;
     W = w; H = h;
     canvas.width = W; canvas.height = H;
     for (const t of [colorMS, depthMS, hdrTex, bloomTex]) t && t.destroy();
-    colorMS = device.createTexture({ size: [W, H], format: HDR, sampleCount: MSAA, usage: TU.RENDER_ATTACHMENT });
-    depthMS = device.createTexture({ size: [W, H], format: 'depth32float', sampleCount: MSAA, usage: TU.RENDER_ATTACHMENT });
     hdrTex = device.createTexture({ size: [W, H], format: HDR, usage: TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING });
+    depthMS = device.createTexture({ size: [W, H], format: 'depth32float', sampleCount: MSAA, usage: TU.RENDER_ATTACHMENT });
+    const hdrView = hdrTex.createView();
+    if (MSAA > 1) {
+      colorMS = device.createTexture({ size: [W, H], format: HDR, sampleCount: MSAA, usage: TU.RENDER_ATTACHMENT });
+      mainPass.colorAttachments[0].view = colorMS.createView();
+      mainPass.colorAttachments[0].resolveTarget = hdrView;
+      mainPass.colorAttachments[0].storeOp = 'discard';
+    } else {
+      colorMS = null;
+      mainPass.colorAttachments[0].view = hdrView;
+      mainPass.colorAttachments[0].resolveTarget = undefined;
+      mainPass.colorAttachments[0].storeOp = 'store';
+    }
+    mainPass.depthStencilAttachment.view = depthMS.createView();
     const bw = Math.max(1, W >> 1), bh = Math.max(1, H >> 1);
     bloomTex = device.createTexture({ size: [bw, bh], format: HDR, mipLevelCount: BLOOM_LEVELS, usage: TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING });
-    mainPass.colorAttachments[0].view = colorMS.createView();
-    mainPass.colorAttachments[0].resolveTarget = hdrTex.createView();
-    mainPass.depthStencilAttachment.view = depthMS.createView();
-    const hdrView = hdrTex.createView();
     const bv = [];
     for (let m = 0; m < BLOOM_LEVELS; m++) bv.push(bloomTex.createView({ baseMipLevel: m, mipLevelCount: 1 }));
     downPasses = []; upPasses = []; downBGs = []; upBGs = [];
@@ -6852,6 +7038,12 @@ async function main() {
     writeRainUniforms(dt);
 
     writeFrame(simTime);
+    const shadowTexel = SHADOW_SPAN / SHADOW_N;
+    shadowF[0] = Math.floor((cam.x - SHADOW_SPAN * 0.5) / shadowTexel) * shadowTexel;
+    shadowF[1] = Math.floor((cam.z - SHADOW_SPAN * 0.5) / shadowTexel) * shadowTexel;
+    shadowF[2] = shadowTexel;
+    shadowF[3] = SHADOW_SPAN;
+    device.queue.writeBuffer(shadowUBO, 0, shadowF);
     selectAll();
     if (nodeCount) device.queue.writeBuffer(instBuf, 0, instData, 0, nodeCount * 4);
 
@@ -6893,6 +7085,16 @@ async function main() {
     cp.setBindGroup(0, bgAP);
     cp.dispatchWorkgroups(Math.ceil(AP_RES / 8), Math.ceil(AP_RES / 8));
     encodeRain(cp);
+    // Cloud shadows and water reflections are baked at a fixed small size, so they do not
+    // get cheaper when the picture scales down. Every other frame is enough: both move slowly.
+    if ((frameIndex & 1) === 0) {
+      cp.setPipeline(shadowPipe);
+      cp.setBindGroup(0, bgShadow);
+      cp.dispatchWorkgroups(SHADOW_N / 8, SHADOW_N / 8);
+      cp.setPipeline(reflPipe);
+      cp.setBindGroup(0, bgRefl);
+      cp.dispatchWorkgroups(REFL_W / 8, REFL_H / 8);
+    }
     cp.end();
 
     const rp = enc.beginRenderPass(mainPass);
@@ -6933,7 +7135,7 @@ async function main() {
 
     const fade = tour.fade * tour.fade * (3 - 2 * tour.fade);
     compData[0] = P.exposure * fade; compData[1] = P.bloom; compData[2] = frameIndex % 64; compData[3] = 0.10;
-    compData[4] = 1.04; compData[5] = 1.05; compData[6] = 0.0; compData[7] = 0;
+    compData[4] = 1.04; compData[5] = 1.05; compData[6] = 0.0; compData[7] = presentSharpen;
     device.queue.writeBuffer(compUBO, 0, compData);
     const swapTex = ctx.getCurrentTexture();
     compPass.colorAttachments[0].view = swapTex.createView();

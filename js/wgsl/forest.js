@@ -107,29 +107,35 @@ fn canopyAt(p: vec2f, sampleMasks: bool, dens0: f32, conif0: f32) -> Canopy {
   return best;
 }
 
-// Fraction of sunlight reaching a point y0 metres above the ground at p, marched through
-// the neighbouring crowns. Crowns pass a little light (porosity). Past the end of the march
-// a ray that is still well inside the canopy layer counts as blocked by the stand density.
-fn canopyShadow(p: vec2f, y0: f32, L: vec3f, dens: f32, conif: f32, groundGrad: vec2f) -> f32 {
+// Fraction of sunlight reaching a point y0 metres above the ground at p.
+// A closed stand shades its own floor from density alone. Individual neighbour crowns
+// are marched only while they cover more than a couple of pixels — the old 9-step
+// march ran on most of an aerial frame and was the bulk of the GPU cost.
+fn canopyShadow(p: vec2f, y0: f32, L: vec3f, dens: f32, conif: f32, groundGrad: vec2f, fp: f32) -> f32 {
   let lh = length(L.xz);
   if (lh < 1e-3 || dens < 0.004) { return 1.0; }
-  let dir = L.xz / lh;
-  let rise = L.y / lh - dot(groundGrad, dir);
-  let topMax = F.forest.z * 1.5;
-  let stepL = F.forest.y * 0.45;
-  var t = stepL * 0.6;
-  var occ = 0.0;
-  for (var i = 0; i < 9; i++) {
-    let ry = y0 + t * rise;
-    if (ry > topMax) { return 1.0 - occ; }
-    let c = canopyAt(p + dir * t, false, dens, conif);
-    if (c.hit) { occ = max(occ, smoothstep(-0.4, 1.4, c.y - ry) * 0.88); }
-    if (occ > 0.87) { return 1.0 - occ; }
-    t += stepL;
+  let top = max(F.forest.z, 1.0);
+  let sunk = smoothstep(-0.02, 0.35, L.y);
+  let depth = smoothstep(top * 0.95, top * 0.2, y0) * smoothstep(0.05, 0.5, dens);
+  var occ = depth * mix(0.78, 0.34, sunk);
+  let sp = F.forest.y;
+  if (fp < sp * 0.5) {
+    let dir = L.xz / lh;
+    let rise = L.y / lh - dot(groundGrad, dir);
+    let stepL = sp * 0.85;
+    var t = stepL * 0.5;
+    let limit = select(3, 2, fp > sp * 0.22);
+    for (var i = 0; i < 3; i++) {
+      if (i >= limit) { break; }
+      let ry = y0 + t * rise;
+      if (ry > top * 1.4) { break; }
+      let c = canopyAt(p + dir * t, false, dens, conif);
+      if (c.hit) { occ = max(occ, smoothstep(-0.3, 1.15, c.y - ry) * 0.9); }
+      if (occ > 0.86) { break; }
+      t += stepL;
+    }
   }
-  let ry = y0 + t * rise;
-  let deep = (1.0 - smoothstep(0.3, 0.95, ry / max(F.forest.z, 1.0))) * smoothstep(0.05, 0.6, dens);
-  return 1.0 - max(occ, deep * 0.82);
+  return clamp(1.0 - occ, 0.0, 1.0);
 }
 
 // ---- foliage colour (linear albedo) ------------------------------------------------

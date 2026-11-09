@@ -4,7 +4,7 @@
 // lives in preallocated typed arrays / descriptors (no per-frame garbage apart from the
 // unavoidable swap-chain view and command buffer objects).
 import { SKY_W, SKY_H, AP_RES, CLIP_RES, CLIP_LEVELS, CLIP_TEXEL0, PROBE_N } from './wgsl/common.js';
-import { TRANS_LUT, MS_LUT, SKYVIEW_LUT, AP_LUT } from './wgsl/sky.js';
+import { TRANS_LUT, MS_LUT, SKYVIEW_LUT, AP_LUT, cloudShadowBakeWGSL, skyReflectBakeWGSL, SHADOW_N, SHADOW_SPAN, REFL_W, REFL_H } from './wgsl/sky.js';
 import { CLIP_HEIGHT, CLIP_DERIVE, HEIGHT_PROBE } from './wgsl/terrain.js';
 import { SKY_BG, landWGSL } from './wgsl/land.js';
 import { BLOOM_DOWN, BLOOM_UP, COMPOSITE } from './wgsl/post.js';
@@ -291,15 +291,17 @@ async function main() {
   // --------------------------------------------------------------------------------------
   // Render pipelines
   // --------------------------------------------------------------------------------------
-  const MSAA = 4;
+  const MSAA = 1;
   const HDR = 'rgba16float';
-  const [landMod, skyMod, downMod, upMod, compMod, rainInitPipe, rainDropPipe, rainDrawMod, rainMistMod] = await Promise.all([
+  const [landMod, skyMod, downMod, upMod, compMod, rainInitPipe, rainDropPipe, rainDrawMod, rainMistMod, shadowPipe, reflPipe] = await Promise.all([
     shader(landWGSL(hasF32Filter), 'land'), shader(SKY_BG, 'sky'), shader(BLOOM_DOWN, 'bloom down'),
     shader(BLOOM_UP, 'bloom up'), shader(COMPOSITE, 'composite'),
     computePipe(RAIN_DROP_INIT, 'rain init'),
     computePipe(RAIN_DROP_UPDATE, 'rain drops'),
     shader(RAIN_DRAW, 'rain draw'),
     shader(RAIN_MIST, 'rain mist'),
+    computePipe(cloudShadowBakeWGSL(hasF32Filter), 'cloud shadow'),
+    computePipe(skyReflectBakeWGSL(), 'sky reflect'),
   ]);
   const PREMUL = {
     color: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
@@ -367,8 +369,33 @@ async function main() {
     fragment: { module: compMod, entryPoint: 'fs', targets: [{ format: swapFormat }] },
   });
 
-  const bgLand = bg(landPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp, starView, apView,
-    arr(clipA), arr(clipB), { buffer: clipUBO }, { buffer: rainUBO }], 'land');
+  const shadowTex = device.createTexture({
+    label: 'cloud shadow', size: [SHADOW_N, SHADOW_N], format: HDR,
+    usage: TU.STORAGE_BINDING | TU.TEXTURE_BINDING,
+  });
+  const shadowView = shadowTex.createView();
+  const shadowUBO = mkBuf(16, GU.UNIFORM | GU.COPY_DST, 'shadow map');
+  const shadowF = new Float32Array(4);
+  const reflTex = device.createTexture({
+    label: 'sky reflect', size: [REFL_W, REFL_H], format: HDR,
+    usage: TU.STORAGE_BINDING | TU.TEXTURE_BINDING,
+  });
+  const reflView = reflTex.createView();
+  const reflSamp = device.createSampler({
+    magFilter: 'linear', minFilter: 'linear',
+    addressModeU: 'repeat', addressModeV: 'clamp-to-edge',
+  });
+  const bgShadow = bg(shadowPipe, [
+    { buffer: frameUBO }, transView, skyView, sampClamp, starView,
+    arr(clipA), arr(clipB), { buffer: clipUBO }, { buffer: shadowUBO }, shadowView, { buffer: rainUBO },
+  ], 'cloud shadow');
+  const bgRefl = bg(reflPipe, [
+    { buffer: frameUBO }, transView, skyView, sampClamp, starView, { buffer: rainUBO }, reflView,
+  ], 'sky reflect');
+
+  const bgLand = bg(landPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp, apView,
+    arr(clipA), arr(clipB), { buffer: clipUBO }, { buffer: rainUBO },
+    shadowView, { buffer: shadowUBO }, reflView, reflSamp], 'land');
   const bgSky = bg(skyPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp, starView, { buffer: rainUBO }], 'sky');
   const bgRainInit = bg(rainInitPipe, [{ buffer: rainUBO }, { buffer: dropBuf }], 'rain init');
   const bgRainDrop = bg(rainDropPipe, [{ buffer: rainUBO }, { buffer: frameUBO }, { buffer: dropBuf }], 'rain drop');
@@ -409,13 +436,16 @@ async function main() {
   for (let i = 0; i < BLOOM_LEVELS * 2; i++) bloomUBOs.push(mkBuf(16, GU.UNIFORM | GU.COPY_DST, 'bloom ubo'));
 
   let W = 0, H = 0;
-  // A frame that runs past one refresh is shown twice, so the flight appears to stutter.
-  // paceScale eases the drawing resolution down just enough to fit, then back up when the
-  // GPU has room. It never goes above the Render scale setting.
+  // A picture frame should finish the frame and let the GPU sleep. Shading this landscape
+  // at a native 4K framebuffer is what pinned a strong card at 30 fps. The drawing target
+  // stays within a 1440p budget (the Render scale slider still reaches 4K at 1.5), and
+  // paceScale eases it further if a frame still runs long, then back up when there is room.
+  const RENDER_PIXELS = 2560 * 1440;
   let paceScale = 1;
   let paceHold = 0;
   let paceSeen = 0;
   let paceFresh = 0;
+  let presentSharpen = 0;
   function considerPace(dt) {
     if (!hasTS || gpuMs <= 0 || shotName) return;
     // The first frames bake every terrain level at once, so the early GPU time is not
@@ -423,13 +453,16 @@ async function main() {
     paceSeen += dt;
     if (paceSeen < 2.5) return;
     paceHold += dt;
-    if (paceHold < 1.2) return;
+    if (paceHold < 0.8) return;
     paceHold = 0;
     let next = paceScale;
-    if (gpuMs > 15.5) next = paceScale * Math.sqrt(14.5 / gpuMs);
-    else if (gpuMs < 12 && paceScale < 1) next = Math.min(1, paceScale * Math.sqrt(13 / gpuMs));
-    next = Math.max(paceScale - 0.15, Math.min(paceScale + 0.1, next));
-    next = Math.max(0.6, Math.min(1, Math.round(next * 20) / 20));
+    // Aim under ~9 ms so a 60 Hz display still has idle time. Filling the whole refresh
+    // is what made the fans spin like a stress test.
+    if (gpuMs > 11) next = paceScale * Math.sqrt(9 / gpuMs);
+    else if (gpuMs < 7.5 && paceScale < 1) next = Math.min(1, paceScale * Math.sqrt(8.5 / gpuMs));
+    const stepDown = gpuMs > 20 ? 0.25 : 0.12;
+    next = Math.max(paceScale - stepDown, Math.min(paceScale + 0.08, next));
+    next = Math.max(0.5, Math.min(1, Math.round(next * 20) / 20));
     if (next === paceScale) return;
     paceScale = next;
     // The running average was measured at the old resolution. Ignore it, and the
@@ -451,22 +484,52 @@ async function main() {
 
   function resize() {
     const fw = Number(qs.get('w')) || 0, fh = Number(qs.get('h')) || 0;
-    const dpr = (window.devicePixelRatio || 1) * P.renderScale * paceScale;
-    const w = fw || Math.max(1, Math.round(canvas.clientWidth * dpr));
-    const h = fh || Math.max(1, Math.round(canvas.clientHeight * dpr));
+    const dpr = window.devicePixelRatio || 1;
+    let w, h, sharpen = 0;
+    if (fw && fh) {
+      w = fw;
+      h = fh;
+    } else {
+      const cssW = Math.max(1, canvas.clientWidth);
+      const cssH = Math.max(1, canvas.clientHeight);
+      const scale = dpr * P.renderScale * paceScale;
+      w = cssW * scale;
+      h = cssH * scale;
+      const budget = RENDER_PIXELS * P.renderScale * P.renderScale * paceScale * paceScale;
+      const pixels = w * h;
+      if (pixels > budget) {
+        const s = Math.sqrt(budget / pixels);
+        w *= s;
+        h *= s;
+      }
+      const native = cssW * cssH * dpr * dpr;
+      const drawn = Math.max(1, w * h);
+      if (native > drawn * 1.08) sharpen = Math.min(0.42, (Math.sqrt(native / drawn) - 1) * 0.55);
+    }
+    w = Math.max(1, Math.round(w));
+    h = Math.max(1, Math.round(h));
+    presentSharpen = sharpen;
     if (w === W && h === H) return;
     W = w; H = h;
     canvas.width = W; canvas.height = H;
     for (const t of [colorMS, depthMS, hdrTex, bloomTex]) t && t.destroy();
-    colorMS = device.createTexture({ size: [W, H], format: HDR, sampleCount: MSAA, usage: TU.RENDER_ATTACHMENT });
-    depthMS = device.createTexture({ size: [W, H], format: 'depth32float', sampleCount: MSAA, usage: TU.RENDER_ATTACHMENT });
     hdrTex = device.createTexture({ size: [W, H], format: HDR, usage: TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING });
+    depthMS = device.createTexture({ size: [W, H], format: 'depth32float', sampleCount: MSAA, usage: TU.RENDER_ATTACHMENT });
+    const hdrView = hdrTex.createView();
+    if (MSAA > 1) {
+      colorMS = device.createTexture({ size: [W, H], format: HDR, sampleCount: MSAA, usage: TU.RENDER_ATTACHMENT });
+      mainPass.colorAttachments[0].view = colorMS.createView();
+      mainPass.colorAttachments[0].resolveTarget = hdrView;
+      mainPass.colorAttachments[0].storeOp = 'discard';
+    } else {
+      colorMS = null;
+      mainPass.colorAttachments[0].view = hdrView;
+      mainPass.colorAttachments[0].resolveTarget = undefined;
+      mainPass.colorAttachments[0].storeOp = 'store';
+    }
+    mainPass.depthStencilAttachment.view = depthMS.createView();
     const bw = Math.max(1, W >> 1), bh = Math.max(1, H >> 1);
     bloomTex = device.createTexture({ size: [bw, bh], format: HDR, mipLevelCount: BLOOM_LEVELS, usage: TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING });
-    mainPass.colorAttachments[0].view = colorMS.createView();
-    mainPass.colorAttachments[0].resolveTarget = hdrTex.createView();
-    mainPass.depthStencilAttachment.view = depthMS.createView();
-    const hdrView = hdrTex.createView();
     const bv = [];
     for (let m = 0; m < BLOOM_LEVELS; m++) bv.push(bloomTex.createView({ baseMipLevel: m, mipLevelCount: 1 }));
     downPasses = []; upPasses = []; downBGs = []; upBGs = [];
@@ -3076,6 +3139,12 @@ async function main() {
     writeRainUniforms(dt);
 
     writeFrame(simTime);
+    const shadowTexel = SHADOW_SPAN / SHADOW_N;
+    shadowF[0] = Math.floor((cam.x - SHADOW_SPAN * 0.5) / shadowTexel) * shadowTexel;
+    shadowF[1] = Math.floor((cam.z - SHADOW_SPAN * 0.5) / shadowTexel) * shadowTexel;
+    shadowF[2] = shadowTexel;
+    shadowF[3] = SHADOW_SPAN;
+    device.queue.writeBuffer(shadowUBO, 0, shadowF);
     selectAll();
     if (nodeCount) device.queue.writeBuffer(instBuf, 0, instData, 0, nodeCount * 4);
 
@@ -3117,6 +3186,16 @@ async function main() {
     cp.setBindGroup(0, bgAP);
     cp.dispatchWorkgroups(Math.ceil(AP_RES / 8), Math.ceil(AP_RES / 8));
     encodeRain(cp);
+    // Cloud shadows and water reflections are baked at a fixed small size, so they do not
+    // get cheaper when the picture scales down. Every other frame is enough: both move slowly.
+    if ((frameIndex & 1) === 0) {
+      cp.setPipeline(shadowPipe);
+      cp.setBindGroup(0, bgShadow);
+      cp.dispatchWorkgroups(SHADOW_N / 8, SHADOW_N / 8);
+      cp.setPipeline(reflPipe);
+      cp.setBindGroup(0, bgRefl);
+      cp.dispatchWorkgroups(REFL_W / 8, REFL_H / 8);
+    }
     cp.end();
 
     const rp = enc.beginRenderPass(mainPass);
@@ -3157,7 +3236,7 @@ async function main() {
 
     const fade = tour.fade * tour.fade * (3 - 2 * tour.fade);
     compData[0] = P.exposure * fade; compData[1] = P.bloom; compData[2] = frameIndex % 64; compData[3] = 0.10;
-    compData[4] = 1.04; compData[5] = 1.05; compData[6] = 0.0; compData[7] = 0;
+    compData[4] = 1.04; compData[5] = 1.05; compData[6] = 0.0; compData[7] = presentSharpen;
     device.queue.writeBuffer(compUBO, 0, compData);
     const swapTex = ctx.getCurrentTexture();
     compPass.colorAttachments[0].view = swapTex.createView();
