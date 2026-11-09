@@ -1542,7 +1542,7 @@ async function main() {
           ['tour', 'Tour all regions'],
           ['single', 'One region'],
         ]],
-        ['scene', 'Region', 'select', SCENES.map((s) => [s.id, s.name])],
+        ['scene', 'Region', 'select', SCENES.map((s) => [s.id, s.name]).sort((a, b) => a[1].localeCompare(b[1], 'en'))],
         ['tourOrder', 'Order', 'select', [
           ['sequence', 'In sequence'],
           ['shuffle', 'Shuffle'],
