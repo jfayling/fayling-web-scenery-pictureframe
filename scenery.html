@@ -232,6 +232,12 @@ const CLIP_RES = 512;   // terrain clipmap texels per side and level
 const CLIP_LEVELS = 9;  // texel doubles per level: 2 m ... 512 m
 const CLIP_TEXEL0 = 2;  // finest clipmap texel (m)
 const PROBE_N = 32;     // terrain height probes for the flight controller
+// Trees are real instanced crowns out to TREE_RANGE. The near list uses the full cone,
+// the far list a cheaper one. Past the range the ground carries the stand colour.
+const TREE_RANGE = 6000;
+const TREE_NEAR_DIST = 1800;
+const TREE_MAX = 900000;
+const TREE_NEAR_MAX = 160000;
 
 // Per-frame uniform block shared by every render / sky / terrain shader.
 // Layout must match the Float32Array offsets in main.js (writeFrame).
@@ -1800,34 +1806,16 @@ fn canopyAt(p: vec2f, sampleMasks: bool, dens0: f32, conif0: f32) -> Canopy {
 }
 
 // Fraction of sunlight reaching a point y0 metres above the ground at p.
-// A closed stand shades its own floor from density alone. Individual neighbour crowns
-// are marched only while they cover more than a couple of pixels — the old 9-step
-// march ran on most of an aerial frame and was the bulk of the GPU cost.
-fn canopyShadow(p: vec2f, y0: f32, L: vec3f, dens: f32, conif: f32, groundGrad: vec2f, fp: f32) -> f32 {
-  let lh = length(L.xz);
-  if (lh < 1e-3 || dens < 0.004) { return 1.0; }
+// A closed stand shades its floor and its lower crowns from density. Marching the
+// neighbouring crowns as well reran the tree field several times per pixel, which
+// was most of the remaining landscape cost, and from the air those shadows are
+// smaller than the crown shading already drawn here.
+fn canopyShadow(y0: f32, L: vec3f, dens: f32) -> f32 {
+  if (dens < 0.004) { return 1.0; }
   let top = max(F.forest.z, 1.0);
   let sunk = smoothstep(-0.02, 0.35, L.y);
   let depth = smoothstep(top * 0.95, top * 0.2, y0) * smoothstep(0.05, 0.5, dens);
-  var occ = depth * mix(0.78, 0.34, sunk);
-  let sp = F.forest.y;
-  if (fp < sp * 0.5) {
-    let dir = L.xz / lh;
-    let rise = L.y / lh - dot(groundGrad, dir);
-    let stepL = sp * 0.85;
-    var t = stepL * 0.5;
-    let limit = select(3, 2, fp > sp * 0.22);
-    for (var i = 0; i < 3; i++) {
-      if (i >= limit) { break; }
-      let ry = y0 + t * rise;
-      if (ry > top * 1.4) { break; }
-      let c = canopyAt(p + dir * t, false, dens, conif);
-      if (c.hit) { occ = max(occ, smoothstep(-0.3, 1.15, c.y - ry) * 0.9); }
-      if (occ > 0.86) { break; }
-      t += stepL;
-    }
-  }
-  return clamp(1.0 - occ, 0.0, 1.0);
+  return clamp(1.0 - depth * mix(0.78, 0.34, sunk), 0.0, 1.0);
 }
 
 // ---- foliage colour (linear albedo) ------------------------------------------------
@@ -2230,20 +2218,6 @@ struct VSOut {
   @location(1) xz: vec2f,      // world ground position
 };
 
-// Canopy height seen by the mesh: individual crowns while the grid can resolve them,
-// the stand's mean canopy height beyond. Both depend only on position and spacing.
-fn meshCanopy(xz: vec2f, dens: f32, eff: f32) -> f32 {
-  let sp = F.forest.y;
-  let mean = dens * F.forest.z * 0.62;
-  // Only the finest grid builds individual crowns. A 2 m vertex is already smaller
-  // than the canopy detail the fragment can show from the air, and evaluating a
-  // crown at every coarser vertex was most of the vertex cost.
-  let kNear = 1.0 - smoothstep(0.9, 1.8, eff);
-  if (kNear <= 0.0) { return mean; }
-  let c = canopyAt(xz, true, 0.0, 0.0);
-  return mix(mean, max(c.y, understoryH(dens)), kNear);
-}
-
 @vertex fn vs(@builtin(vertex_index) vi: u32, @location(0) inst: vec4f) -> VSOut {
   let n = u32(F.lodP.y);
   let g = vec2f(f32(vi % (n + 1u)), f32(vi / (n + 1u)));
@@ -2259,9 +2233,6 @@ fn meshCanopy(xz: vec2f, dens: f32, eff: f32) -> f32 {
   let h = clipHeight(xz, lv);
   let wl = waterLevel(xz.y);
   var y = max(h, wl);
-  if (h > wl + 0.2 && F.forest.x > 0.0) {
-    y += meshCanopy(xz, clipB2(xz, lv).x, eff);
-  }
   var o: VSOut;
   var rel = vec3f(xz.x, y, xz.y) - F.camPos.xyz;
   rel.y -= dot(rel.xz, rel.xz) / (2.0 * EARTH_R);
@@ -2290,18 +2261,20 @@ fn moonIlluminance() -> vec3f {
 fn terrainShadow(p: vec3f, L: vec3f) -> f32 {
   if (L.y > 0.8) { return 1.0; }
   let ceiling = waterLevel(p.z) + F.valley.w + F.relief.x * (1.5 - F.biome.z) + 40.0;
-  var t = 20.0;
+  var t = 30.0;
   var res = 1.0;
-  for (var i = 0; i < 12; i++) {
+  // Eight steps, stretching faster than the old twelve. The reach is the same few
+  // kilometres; the dropped samples were the expensive part of every landscape pixel.
+  for (var i = 0; i < 8; i++) {
     let q = p + L * t;
     if (q.y > ceiling) { break; }
-    let texel = max(t * 0.15, 20.0);
-    let lf = clamp(max(clipFinest(q.xz), log2(texel / CLIP_T0)), 0.0, f32(CLIP_L - 1));
+    let texel = max(t * 0.22, 24.0);
+    let lf = clamp(log2(texel / CLIP_T0), 0.0, f32(CLIP_L - 1));
     let h = clipHeight(q.xz, ceil(lf));
     let gap = q.y - h;
     res = min(res, gap / (t * 0.05) + 0.5);
     if (res <= 0.0) { return 0.0; }
-    t *= select(1.42, 1.7, i >= 4);
+    t *= 1.72;
   }
   return smoothstep(0.0, 1.0, res);
 }
@@ -2341,7 +2314,7 @@ fn direct(lt: Light, n: vec3f, sunVis: f32) -> vec3f {
 
 // Ground cover between and outside the trees.
 fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32, curv: f32) -> vec3f {
-  let n1 = fbm2(xz * (1.0 / 45.0) + vec2f(2.0, 9.0), select(3, 2, fp > 3.0));
+  let n1 = fbm2(xz * (1.0 / 45.0) + vec2f(2.0, 9.0), select(2, 1, fp > 6.0));
   let n2 = snoise(xz * (1.0 / 9.0) + vec2f(5.0, 1.0)) * (1.0 - smoothstep(2.0, 9.0, fp));
   let dry = F.forest2.x * 0.6 + smoothstep(-0.2, 0.4, n1) * 0.22;
   let trop = F.biome.w;
@@ -2368,7 +2341,7 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
     c = mix(c, sand, beach);
   }
   // rock: granite greys (dark basalt in the tropics), darker in clefts, lighter on ribs
-  if (rock > 0.02) {
+  if (rock > 0.02 && fp < 12.0) {
   let strata = snoise(vec2f((xz.x + xz.y) * 0.004, above * 0.09)) * 0.5 + 0.5;
   var rk = mix(vec3f(0.12, 0.115, 0.10), vec3f(0.19, 0.18, 0.16), strata);
   // weathered faces carry lichen and moss
@@ -2499,11 +2472,11 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
   } else {
     // ---- land ----
     let sp = F.forest.y;
-    // Individual crowns while they still read as a canopy. The fade used to wait until
-    // a crown was under a pixel, which kept the expensive path on the whole view.
-    let farK = smoothstep(0.38 * sp, 1.05 * sp, fp);
+    // The crowns are instanced trees (trees.js). The ground carries what is between and
+    // under them; once trees are too small to tell apart it carries the stand colour that
+    // the trees themselves fade to.
+    let farK = max(smoothstep(0.35 * sp, 1.0 * sp, fp), smoothstep(0.8 * ${TREE_RANGE}.0, ${TREE_RANGE}.0, dist));
     let gAlb = groundAlbedo(xz, fp, above, dens, M.z, M.w, curv);
-    // bumpy ground normal near the camera
     var Ng = Nt;
     if (fp < 4.0) {
       let b = gnoised(xz * (1.0 / 5.0) + vec2f(3.0, 3.0)).yz * 0.12 * (1.0 - smoothstep(1.0, 4.0, fp));
@@ -2511,57 +2484,17 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
     }
     // valleys and hollows collect less sky light
     let aoT = clamp(1.0 + curv * 4.0, 0.6, 1.0);
-    var crown: Canopy;
-    crown.hit = false;
-    let wantCrown = F.forest.x > 0.0 && dens > 0.02 && farK < 1.0;
-    // The stand mask at this pixel is enough once a crown is only a few pixels wide.
-    // Per-trunk mask lookups are kept for the foreground, where a clearing edge is visible.
-    if (wantCrown) { crown = canopyAt(xz, fp < 0.9, dens, conif); }
     var nearC = vec3f(0.0);
     if (farK < 1.0 && F.forest.x > 0.0) {
-      let c = crown;
       let uy = understoryH(dens);
-      if (c.hit && c.y > uy) {
-        let t = c.tree;
-        // crown texture: branch tufts on conifers, lumpy foliage clusters on broadleaves
-        let kd = 1.0 - smoothstep(0.08 * t.r, 0.45 * t.r, fp);
-        let bf = 1.0 / (t.r * select(0.3, 0.22, t.conifer));
-        // unrolled over the crown surface (radius plus drop from the apex), so the texture
-        // keeps its scale down the steep sides instead of smearing into vertical streaks
-        let dv = xz - t.pos;
-        let dl = max(length(dv), 1e-3);
-        let arc = dl + max(t.top - c.y, 0.0) * 0.8;
-        let q = dv * (arc / dl) * bf + vec2f(t.seed * 1.37, t.seed * 0.71);
-        let b1 = gnoised(q);
-        let b2 = gnoised(q * 2.3 + vec2f(5.1, 2.7));
-        let amp = (t.top - t.base) * select(0.16, 0.10, t.conifer) * kd;
-        let bump = (b1.yz + b2.yz * 2.3 * 0.5) * bf * amp;
-        let gw = grad + c.g + bump;
-        let nC = normalize(vec3f(-gw.x, 1.0, -gw.y));
-        let yb = c.y + (b1.x + b2.x * 0.5) * amp;
-        // deeper crown layers and the clefts between clusters see less sky
-        let depthK = clamp((yb - t.base) / max(t.top - t.base, 1.0), 0.0, 1.0);
-        let ao = (0.45 + 0.55 * depthK) * clamp(1.0 + (b1.x + 0.5 * b2.x) * 0.8 * kd, 0.5, 1.2) * aoT;
-        let sh = canopyShadow(xz, yb, lt.L, dens, conif, grad, fp);
-        let alb = treeAlbedo(t);
-        // foliage scatters forward: some sun comes through thin, backlit crown edges
-        let trans = select(0.35, 0.18, t.conifer) * max(-dot(nC, lt.L), 0.0) * (1.0 - depthK * 0.6);
-        let Hs = normalize(V + lt.L);
-        // leaf sheen, F0 about 0.03 spread over the microfacet lobe
-        let spec = select(0.010, 0.005, t.conifer) * ggx(max(dot(nC, Hs), 0.0), 0.5) * max(dot(nC, lt.L), 0.0)
-                 / max(dot(nC, V), 0.2);
-        nearC = alb * (direct(lt, nC, sh * sunVis) + lt.sun * sh * sunVis * trans + ambient(lt, nC) * ao)
-             + lt.sun * sh * sunVis * spec * PI;  // undone by the 1/pi applied to all land below
-      } else {
-        let sh = canopyShadow(xz, uy, lt.L, dens, conif, grad, fp);
-        // under and between crowns: little sky reaches the floor or the understory
-        let ao = mix(1.0, 0.28, smoothstep(0.0, 0.8, dens)) * aoT;
-        let uK = smoothstep(0.5, 2.0, uy);
-        let under = mix(standAlbedo(1.0), standAlbedo(conif), 0.4) * 0.75;
-        let alb = mix(gAlb, under, uK);
-        let n = normalize(mix(Ng, vec3f(0.0, 1.0, 0.0), uK));
-        nearC = alb * (direct(lt, n, sh * sunVis) + ambient(lt, n) * ao);
-      }
+      let sh = canopyShadow(uy, lt.L, dens);
+      // under and between crowns: little sky reaches the floor or the understory
+      let ao = mix(1.0, 0.28, smoothstep(0.0, 0.8, dens)) * aoT;
+      let uK = smoothstep(0.5, 2.0, uy);
+      let under = mix(standAlbedo(1.0), standAlbedo(conif), 0.4) * 0.75;
+      let alb = mix(gAlb, under, uK);
+      let n = normalize(mix(Ng, vec3f(0.0, 1.0, 0.0), uK));
+      nearC = alb * (direct(lt, n, sh * sunVis) + ambient(lt, n) * ao);
     }
     var farCol = vec3f(0.0);
     if (farK > 0.0 || F.forest.x <= 0.0) {
@@ -2580,34 +2513,7 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
                 + lt.moon * max(dot(standN, lt.M), 0.0) + ambient(lt, standN) * 0.7 * aoT);
       let gapLit = mix(1.0, lit * 0.35, closure);
       let floorC = gAlb * (direct(lt, Nt, sunVis * gapLit) + ambient(lt, Nt) * mix(1.0, 0.3, closure) * aoT);
-      let stat = mix(floorC, stand, closure);
-      farCol = stat;
-      // Open stands (snow, clearings) need the real trees, not a coarser stand-in.
-      // A clump grid splits as the camera advances, so new crowns appear in the gaps.
-      // Each distant mark is the tree that already occupies that cell.
-      let crownR = sp * mix(0.95, 0.48, conif);
-      let area = min(1.0, dens * 3.14159 * crownR * crownR / (sp * sp));
-      let dotK = 1.0 - smoothstep(0.72, 0.95, area);
-      if (dotK > 0.0 && dens > 0.02) {
-        let t = treeCell(vec2i(floor(xz / sp)), true, dens, conif);
-        var cov = 0.0;
-        if (t.ok) {
-          let rad = max(t.r, 0.5);
-          let d = length(xz - t.pos);
-          let aa = max(fp * 0.55, rad * 0.08);
-          let geom = 1.0 - smoothstep(rad - aa, rad + aa, d);
-          // While the crown is smaller than a pixel, tint its whole cell by the
-          // crown's area. The tree is already there; it only sharpens as it grows
-          // on screen. An empty cell stays snow, so nothing has to pop in later.
-          let cellCov = min(0.9, 3.14159 * rad * rad / (sp * sp));
-          let spread = smoothstep(0.4, 1.35, fp / rad);
-          cov = mix(geom, cellCov, spread);
-        }
-        let treeLit = standAlbedo(conif) * (lt.sun * sunVis * lit * crownCos * 0.9
-                    + lt.moon * max(dot(standN, lt.M), 0.0) + ambient(lt, standN) * 0.55 * aoT);
-        let openFloor = gAlb * (direct(lt, Nt, sunVis) + ambient(lt, Nt) * aoT);
-        farCol = mix(stat, mix(openFloor, treeLit, cov), dotK);
-      }
+      farCol = mix(floorC, stand, closure);
     }
     col = select(mix(nearC, farCol, farK), farCol, F.forest.x <= 0.0) * (1.0 / PI);
     // A water film darkens foliage and rock and lifts the leaf sheen.
@@ -2623,7 +2529,7 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
     let below = max(top - py, 0.0);
     if (below > 0.0) {
       // drifting banks of valley fog with clear gaps between them
-      let pn = fbm2(xz * (1.0 / 520.0) + vec2f(F.camPos.w * 0.004, 1.0), 4) * 0.5 + 0.5;
+      let pn = fbm2(xz * (1.0 / 520.0) + vec2f(F.camPos.w * 0.004, 1.0), 2) * 0.5 + 0.5;
       let thick = F.mist.x * 0.0022 * smoothstep(0.5, 0.85, pn) * smoothstep(0.0, F.mist.y * 0.6, below);
       let camIn = max(top - F.camPos.y, 0.0);
       let path = min((below - camIn) / max(V.y, 0.04), dist);
@@ -2663,6 +2569,425 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
     if (F.post.w < 3.5) { return vec4f(vec3f(sunVis) * 0.3, 1.0); }
     return vec4f(Nt * 0.5 + 0.5, 1.0) * 0.3;
   }
+  return vec4f(col, 1.0);
+}
+`;
+}
+
+// ---- js/wgsl/trees.js ----
+// Instanced trees. A compute pass walks the jittered tree grid around the camera, keeps the
+// trees that can be on screen and appends them to a near list (full crown) and a far list
+// (cheap crown) that two indirect draws consume. Every tree is real geometry at every distance,
+// so flying forward never grows or inserts a tree; a crown that shrinks below a pixel is only
+// recoloured towards the stand colour the ground already carries.
+
+
+
+
+
+const TREE_INST_BYTES = 80;
+const TREE_GEN_GROUP = 8;
+const TREE_SEGS_NEAR = 12;
+const TREE_SEGS_FAR = 6;
+// vertices per crown: an apex fan and a shoulder-to-base band near, a single fan far
+const TREE_VERTS_NEAR = TREE_SEGS_NEAR * 9;
+const TREE_VERTS_FAR = TREE_SEGS_FAR * 3;
+
+const TREE_CONSTS = /* wgsl */ `
+const TREE_RANGE: f32 = ${TREE_RANGE}.0;
+const TREE_NEAR_DIST: f32 = ${TREE_NEAR_DIST}.0;
+const TREE_MAX: u32 = ${TREE_MAX}u;
+const TREE_NEAR_MAX: u32 = ${TREE_NEAR_MAX}u;
+const EARTH_R: f32 = 6371000.0;
+const TREE_SEGS_NEAR: u32 = ${TREE_SEGS_NEAR}u;
+const TREE_SEGS_FAR: u32 = ${TREE_SEGS_FAR}u;
+struct TreeInst {
+  a: vec4f,   // xyz = ground position of the trunk, w = crown radius
+  b: vec4f,   // x = apex height, y = lowest crown edge, z = texture seed, w = 1 for conifers
+  c: vec4f,   // x = sun visibility, y = cloud shade * sun up, z = stand density, w = conifer share
+  d: vec4f,   // lit stand colour (radiance / pi), what a sub-pixel crown shows
+  e: vec4f,   // this tree's foliage albedo
+};
+struct Light { sun: vec3f, moon: vec3f, zen: vec3f, hor: vec3f, L: vec3f, M: vec3f };
+@group(0) @binding(10) var<storage, read> LB: array<vec4f, 8>;
+fn readLight() -> Light {
+  var lt: Light;
+  lt.sun = LB[0].xyz; lt.moon = LB[1].xyz; lt.zen = LB[2].xyz;
+  lt.hor = LB[3].xyz; lt.L = LB[4].xyz; lt.M = LB[5].xyz;
+  return lt;
+}
+fn ggx(nh: f32, a: f32) -> f32 {
+  let a2 = a * a;
+  let d = nh * nh * (a2 - 1.0) + 1.0;
+  return a2 / (PI * d * d);
+}
+fn ambient(lt: Light, n: vec3f) -> vec3f {
+  return mix(lt.hor, lt.zen, 0.5 + 0.5 * n.y) * (0.55 + 0.45 * n.y) * PI;
+}
+fn direct(lt: Light, n: vec3f, sunVis: f32) -> vec3f {
+  return lt.sun * sunVis * max(dot(n, lt.L), 0.0) + lt.moon * max(dot(n, lt.M), 0.0);
+}
+`;
+
+// One thread: the light every tree shares this frame (sun and moon illuminance, sky colour).
+function treeLightWGSL() {
+  return FRAME_WGSL + ATMO_CORE_WGSL + /* wgsl */ `
+@group(0) @binding(0) var<uniform> F: Frame;
+@group(0) @binding(1) var transLUT: texture_2d<f32>;
+@group(0) @binding(2) var skyLUT: texture_2d<f32>;
+@group(0) @binding(3) var sampC: sampler;
+` + RAIN_STRUCT + /* wgsl */ `
+@group(0) @binding(4) var<uniform> Rain: RainU;
+@group(0) @binding(5) var<storage, read_write> outL: array<vec4f, 8>;
+` + SKY_RENDER_FUNCS + /* wgsl */ `
+fn moonIlluminance() -> vec3f {
+  if (F.moonDir.w <= 0.0 || F.moonDir.y <= 0.0 || F.sunDir.y >= 0.2) { return vec3f(0.0); }
+  let moon = normalize(F.moonDir.xyz);
+  let lite = normalize(F.moonLight.xyz);
+  let deg = acos(clamp(dot(lite, -moon), -1.0, 1.0)) * (180.0 / PI);
+  let deg2 = deg * deg;
+  let phase = exp(-0.921034037 * (0.026 * deg + 4e-9 * deg2 * deg2));
+  let night = 1.0 - smoothstep(-0.05, 0.18, F.sunDir.y);
+  let size = max(F.moonLight.w, 0.0) / 2.5;
+  let E = F.moonDir.w * phase * night * 0.028 * size * size;
+  return vec3f(1.0, 0.96, 0.9) * sampleTrans(camR(), moon.y) * E;
+}
+@compute @workgroup_size(1)
+fn main() {
+  let L = F.sunDir.xyz;
+  let sunScale = mix(1.0, Rain.atmo.y, step(0.001, Rain.wind.w));
+  let sun = sampleTrans(RG + F.lodP.z * 0.001, L.y) * F.sunDir.w * sunScale;
+  var zen = skyAtmo(vec3f(0.0, 1.0, 0.0));
+  var hor = (skyAtmo(normalize(vec3f(1.0, 0.25, 0.0))) + skyAtmo(normalize(vec3f(-1.0, 0.25, 0.0)))
+          + skyAtmo(normalize(vec3f(0.0, 0.25, 1.0))) + skyAtmo(normalize(vec3f(0.0, 0.25, -1.0)))) * 0.25;
+  let cover = clamp(F.cloudP.y * 0.8 + F.atmo.z * 0.3, 0.0, 1.0);
+  let skyDim = 1.0 - 0.35 * cover;
+  let glow = vec3f(0.002, 0.003, 0.005) * F.nightP.w;
+  zen = zen * skyDim * sunScale + glow;
+  hor = hor * skyDim * sunScale + glow;
+  outL[0] = vec4f(sun, 0.0);
+  outL[1] = vec4f(moonIlluminance(), 0.0);
+  outL[2] = vec4f(zen, 0.0);
+  outL[3] = vec4f(hor, 0.0);
+  outL[4] = vec4f(L, 0.0);
+  outL[5] = vec4f(normalize(F.moonDir.xyz), 0.0);
+}
+`;
+}
+
+// Walks the cells in a square around the camera. Writes the trees that survive the range,
+// water, frustum and stand tests, with their lighting already folded in.
+function treeGenWGSL(filterA) {
+  return FRAME_WGSL + ATMO_CORE_WGSL + /* wgsl */ `
+@group(0) @binding(0) var<uniform> F: Frame;
+@group(0) @binding(1) var sampC: sampler;
+@group(0) @binding(2) var clipA: texture_2d_array<f32>;
+@group(0) @binding(3) var clipB: texture_2d_array<f32>;
+@group(0) @binding(4) var<uniform> CL: ClipLevels;
+struct ShadowMap { origin: vec2f, texel: f32, span: f32 };
+@group(0) @binding(5) var cloudShadowTex: texture_2d<f32>;
+@group(0) @binding(6) var<uniform> SH: ShadowMap;
+struct GenU { cell0: vec2i, dim: u32, pad: u32 };
+@group(0) @binding(7) var<uniform> G: GenU;
+@group(0) @binding(8) var<storage, read_write> trees: array<TreeInst>;
+@group(0) @binding(9) var<storage, read_write> args: array<atomic<u32>, 8>;
+` + NOISE_WGSL + TERRAIN_FUNCS + clipSampleWGSL(filterA) + FOREST_FUNCS + TREE_CONSTS + /* wgsl */ `
+fn terrainShadow(p: vec3f, L: vec3f) -> f32 {
+  if (L.y > 0.8) { return 1.0; }
+  let ceiling = waterLevel(p.z) + F.valley.w + F.relief.x * (1.5 - F.biome.z) + 40.0;
+  var t = 30.0;
+  var res = 1.0;
+  for (var i = 0; i < 8; i++) {
+    let q = p + L * t;
+    if (q.y > ceiling) { break; }
+    let texel = max(t * 0.22, 24.0);
+    let lf = clamp(log2(texel / CLIP_T0), 0.0, f32(CLIP_L - 1));
+    let h = clipHeight(q.xz, ceil(lf));
+    let gap = q.y - h;
+    res = min(res, gap / (t * 0.05) + 0.5);
+    if (res <= 0.0) { return 0.0; }
+    t *= 1.72;
+  }
+  return smoothstep(0.0, 1.0, res);
+}
+fn cloudShade(world: vec3f) -> f32 {
+  if (F.cloudP.w <= 0.001 || F.sunDir.y <= 0.0) { return 1.0; }
+  let uv = (world.xz - SH.origin) / SH.span;
+  let edge = smoothstep(0.0, 0.03, uv.x) * smoothstep(0.0, 0.03, uv.y)
+           * smoothstep(0.0, 0.03, 1.0 - uv.x) * smoothstep(0.0, 0.03, 1.0 - uv.y);
+  let s = textureSampleLevel(cloudShadowTex, sampC, clamp(uv, vec2f(0.001), vec2f(0.999)), 0.0).r;
+  return mix(1.0, s, edge);
+}
+
+@compute @workgroup_size(${TREE_GEN_GROUP}, ${TREE_GEN_GROUP}, 1)
+fn main(@builtin(global_invocation_id) id: vec3u) {
+  if (id.x >= G.dim || id.y >= G.dim) { return; }
+  if (F.forest.x <= 0.0) { return; }
+  let cell = G.cell0 + vec2i(id.xy);
+  let sp = F.forest.y;
+  // trunk position and the cheap range test first: most cells stop here
+  let h0 = pcgHash((u32(cell.x) * 73856093u) ^ (u32(cell.y) * 19349663u + seedU() + 0x5bd1e995u));
+  let pos = (vec2f(cell) + 0.5 + (vec2f(unit16(h0), unit16(h0 >> 16u)) - 0.5) * 0.8) * sp;
+  let relH = pos - F.camPos.xz;
+  let d2 = dot(relH, relH);
+  if (d2 > TREE_RANGE * TREE_RANGE) { return; }
+  let dist = sqrt(d2);
+  // stand mask first, it is one texture read
+  let m = treeMasks(pos);
+  if (m.x < 0.02) { return; }
+  let t = treeCell(cell, false, m.x, m.y);
+  if (!t.ok) { return; }
+  // Ground under the trunk, at the same continuous level the terrain mesh uses. A stepped
+  // level made every tree grow or sink as the level boundary swept past it.
+  let d3 = distance(vec3f(pos.x, F.lodP.z, pos.y), F.camPos.xyz);
+  let lod = clamp(ceil(log2(max(d3, 1.0) / F.lodP.x)), 0.0, 9.0);
+  let range = F.lodP.x * exp2(lod);
+  let spacing = (F.lodP.x / (16.0 * F.lodP.y)) * exp2(lod);
+  let morph = clamp((d3 - 0.8 * range) / (0.2 * range), 0.0, 1.0);
+  let lv = clamp(max(clipFinest(pos), log2(spacing * (1.0 + morph) / CLIP_T0)), 0.0, f32(CLIP_L - 1));
+  let gy = clipHeight(pos, lv);
+  if (gy <= waterLevel(pos.y) + 0.2) { return; }
+  // frustum, padded by the size of the crown
+  let R = max(t.r * 1.3, 2.0) + t.top * 0.5;
+  let rel = vec3f(pos.x - F.camPos.x, gy + t.top * 0.5 - F.camPos.y, pos.y - F.camPos.z);
+  let z = dot(rel, F.camFwd.xyz);
+  if (z < -R) { return; }
+  if (z > R) {
+    let tx = length(F.camRight.xyz);
+    let ty = length(F.camUp.xyz);
+    let nx = abs(dot(rel, F.camRight.xyz)) / (tx * tx * z);
+    let ny = abs(dot(rel, F.camUp.xyz)) / (ty * ty * z);
+    if (nx > 1.05 + R / (z * tx) || ny > 1.05 + R / (z * ty)) { return; }
+  }
+
+  // light this tree sees
+  var lt = readLight();
+  let ground = vec3f(pos.x, gy, pos.y);
+  let sunUp = smoothstep(-0.015, 0.02, lt.L.y);
+  var sunVis = 0.0;
+  var cloudSh = 1.0;
+  if (sunUp > 0.0) {
+    cloudSh = cloudShade(ground);
+    sunVis = terrainShadow(ground + vec3f(0.0, 2.0, 0.0), lt.L) * cloudSh * sunUp;
+  }
+  // the stand this tree belongs to, lit the way the far ground is lit
+  let V = normalize(F.camPos.xyz - vec3f(pos.x, gy + t.top * 0.6, pos.y));
+  let g = acos(clamp(dot(V, lt.L), -1.0, 1.0));
+  let litBase = clamp(0.22 + 0.5 * lt.L.y + 0.22 * V.y, 0.0, 1.0);
+  let lit = mix(litBase, 1.0, exp(-g * 3.5));
+  let side = sqrt(max(1.0 - lt.L.y * lt.L.y, 0.0)) * smoothstep(-0.02, 0.1, lt.L.y);
+  let crownCos = max(lt.L.y, 0.0) * 0.75 + side * mix(0.3, 0.4, m.y);
+  let up = vec3f(0.0, 1.0, 0.0);
+  let stand = standAlbedoAt(pos, m.y) * (lt.sun * sunVis * lit * crownCos
+            + lt.moon * max(dot(up, lt.M), 0.0) + ambient(lt, up) * 0.7) * (1.0 / PI);
+  let alb = treeAlbedo(t);
+
+  var inst: TreeInst;
+  inst.a = vec4f(pos.x, gy, pos.y, t.r);
+  inst.b = vec4f(t.top, t.base, t.seed, select(0.0, 1.0, t.conifer));
+  inst.c = vec4f(sunVis, cloudSh * sunUp, m.x, m.y);
+  inst.d = vec4f(stand, 0.0);
+  inst.e = vec4f(alb, 0.0);
+  if (dist < TREE_NEAR_DIST) {
+    let i = atomicAdd(&args[1], 1u);
+    if (i < TREE_NEAR_MAX) { trees[i] = inst; }
+  } else {
+    let j = atomicAdd(&args[5], 1u);
+    if (j < TREE_MAX - TREE_NEAR_MAX) { trees[TREE_MAX - 1u - j] = inst; }
+  }
+}
+`;
+}
+
+// Crowns. The near list is a twelve-sided cone in three rings (apex, shoulder, base), the far
+// list a single six-triangle fan. Both are shaded from the same analytic cone or dome the old
+// per-pixel crowns used.
+function treeDrawWGSL() {
+  return FRAME_WGSL + ATMO_CORE_WGSL + /* wgsl */ `
+@group(0) @binding(0) var<uniform> F: Frame;
+@group(0) @binding(2) var<storage, read> trees: array<TreeInst>;
+@group(0) @binding(3) var apTex: texture_3d<f32>;
+@group(0) @binding(4) var sampC: sampler;
+` + RAIN_STRUCT + /* wgsl */ `
+@group(0) @binding(5) var<uniform> Rain: RainU;
+` + NOISE_WGSL + TERRAIN_FUNCS + TREE_CONSTS + /* wgsl */ `
+const AP_N: f32 = ${AP_RES}.0;
+const AP_MAX: f32 = ${AP_MAX_KM}.0;
+override FAR: bool = false;
+
+struct VOut {
+  @builtin(position) pos: vec4f,
+  @location(0) rel: vec3f,
+  @location(1) dv: vec2f,
+  @location(2) @interpolate(flat) ti: u32,
+};
+
+@vertex fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VOut {
+  var o: VOut;
+  o.pos = vec4f(2.0, 2.0, 2.0, 1.0);   // outside the clip volume: the triangle is discarded
+  o.rel = vec3f(0.0);
+  o.dv = vec2f(0.0);
+  o.ti = 0u;
+  var ti = ii;
+  if (FAR) {
+    if (ii >= TREE_MAX - TREE_NEAR_MAX) { return o; }
+    ti = TREE_MAX - 1u - ii;
+  } else if (ii >= TREE_NEAR_MAX) {
+    return o;
+  }
+  let I = trees[ti];
+  let top = I.b.x;
+  let base = I.b.y;
+  let conifer = I.b.w > 0.5;
+  let span = max(top - base, 0.5);
+  let centre = vec3f(I.a.x, I.a.y, I.a.z);
+  // True crown radius at every distance. Enlarging small crowns to a minimum pixel size
+  // made them shrink back to their real width as the camera approached, a ripple of
+  // growing and shrinking that travelled through the forest.
+  let r = I.a.w;
+
+  let tri = vi / 3u;
+  let k = vi % 3u;
+  var ring = 0u;     // 0 apex, 1 shoulder, 2 base
+  var si = 0u;
+  let segs = select(TREE_SEGS_NEAR, TREE_SEGS_FAR, FAR);
+  if (FAR) {
+    if (k > 0u) { ring = 2u; si = tri + k - 1u; }
+  } else if (tri < segs) {
+    if (k > 0u) { ring = 1u; si = tri + k - 1u; }
+  } else {
+    let q = tri - segs;
+    let i = q >> 1u;
+    if ((q & 1u) == 0u) {
+      if (k == 0u) { ring = 1u; si = i; } else { ring = 2u; si = i + select(0u, 1u, k == 2u); }
+    } else {
+      if (k == 0u) { ring = 1u; si = i; } else if (k == 1u) { ring = 2u; si = i + 1u; } else { ring = 1u; si = i + 1u; }
+    }
+  }
+  // normalised radius and the crown height there
+  var u = 0.0;
+  if (ring == 1u) { u = select(0.62, 0.5, conifer); }
+  if (ring == 2u) { u = 1.0; }
+  var y = top;
+  if (ring > 0u) {
+    y = select(base + span * (1.0 - u * u), top - span * pow(u, 0.85), conifer);
+  }
+  let seed = I.b.z;
+  let a = f32(si % segs) * (6.2831853 / f32(segs)) + seed * 0.37;
+  // A polygon with the area of the round crown. Trimming a larger one to the circle in the
+  // fragment shader (discard) turned off early depth testing, and every crown hidden behind
+  // the first one was shaded as well.
+  let rad = u * r * select(1.023, 1.0996, FAR);
+  let dv = vec2f(cos(a), sin(a)) * rad;
+  var rel = vec3f(centre.x + dv.x, centre.y + y, centre.z + dv.y) - F.camPos.xyz;
+  rel.y -= dot(rel.xz, rel.xz) / (2.0 * EARTH_R);
+  o.rel = rel;
+  o.pos = F.viewProj * vec4f(rel, 1.0);
+  o.dv = dv;
+  o.ti = ti;
+  return o;
+}
+
+@fragment fn fs(in: VOut) -> @location(0) vec4f {
+  let I = trees[in.ti];
+  let fp = max(length(dpdx(in.dv)), length(dpdy(in.dv)));
+  let dist = length(in.rel);
+  let V = -in.rel / dist;
+  let conifer = I.b.w > 0.5;
+  let top = I.b.x;
+  let base = I.b.y;
+  let r = I.a.w;
+  let span = max(top - base, 0.5);
+  let sunVis = I.c.x;
+  let cloudSu = I.c.y;
+  let dens = I.c.z;
+  var lt = readLight();
+
+  // how much of this crown is still a crown: below a pixel it is the stand colour
+  let kS = smoothstep(0.6, 2.2, fp / max(r, 0.1));
+  var col = I.d.xyz;
+  let d = max(length(in.dv), 1e-3);
+  if (kS < 0.999) {
+    let x = clamp(d / r, 0.02, 1.0);
+    var yc: f32;
+    var dydd: f32;
+    if (conifer) {
+      let px = pow(x, 0.85);
+      yc = top - span * px;
+      dydd = -span * 0.85 * px / (x * r);
+    } else {
+      yc = base + span * (1.0 - x * x);
+      dydd = -span * 2.0 * x / r;
+    }
+    let cg = in.dv / d * dydd;
+    // crown texture: branch tufts on conifers, lumpy foliage clusters on broadleaves
+    let kd = 1.0 - smoothstep(0.08 * r, 0.45 * r, fp);
+    let bf = 1.0 / (r * select(0.3, 0.22, conifer));
+    let arc = d + max(top - yc, 0.0) * 0.8;
+    let q = in.dv * (arc / d) * bf + vec2f(I.b.z * 1.37, I.b.z * 0.71);
+    var b1 = vec3f(0.0);
+    var b2 = vec3f(0.0);
+    if (kd > 0.01) {
+      b1 = gnoised(q);
+      b2 = gnoised(q * 2.3 + vec2f(5.1, 2.7));
+    }
+    let amp = span * select(0.16, 0.10, conifer) * kd;
+    let bump = (b1.yz + b2.yz * 2.3 * 0.5) * bf * amp;
+    let gw = cg + bump;
+    let nC = normalize(vec3f(-gw.x, 1.0, -gw.y));
+    let yb = yc + (b1.x + b2.x * 0.5) * amp;
+    let depthK = clamp((yb - base) / max(span, 1.0), 0.0, 1.0);
+    let ao = (0.45 + 0.55 * depthK) * clamp(1.0 + (b1.x + 0.5 * b2.x) * 0.8 * kd, 0.5, 1.2);
+    // a closed stand shades its lower crowns
+    let sunk = smoothstep(-0.02, 0.35, lt.L.y);
+    let shDepth = smoothstep(max(F.forest.z, 1.0) * 0.95, max(F.forest.z, 1.0) * 0.2, yb) * smoothstep(0.05, 0.5, dens);
+    let sh = select(1.0, clamp(1.0 - shDepth * mix(0.78, 0.34, sunk), 0.0, 1.0), dens > 0.004);
+    let alb = I.e.xyz;
+    let trans = select(0.35, 0.18, conifer) * max(-dot(nC, lt.L), 0.0) * (1.0 - depthK * 0.6);
+    let Hs = normalize(V + lt.L);
+    let spec = select(0.010, 0.005, conifer) * ggx(max(dot(nC, Hs), 0.0), 0.5) * max(dot(nC, lt.L), 0.0)
+             / max(dot(nC, V), 0.2);
+    let own = (alb * (direct(lt, nC, sh * sunVis) + lt.sun * sh * sunVis * trans + ambient(lt, nC) * ao)
+             + lt.sun * sh * sunVis * spec * PI) * (1.0 / PI);
+    col = mix(own, col, kS);
+  }
+  col *= mix(1.0, 0.72, Rain.amt.x);
+
+  // valley mist, precipitation and aerial perspective, as for the ground
+  let xz = vec2f(I.a.x, I.a.z) + in.dv;
+  let wl = waterLevel(xz.y);
+  if (F.mist.x > 0.0) {
+    let topM = wl + F.mist.y;
+    let py = F.camPos.y + in.rel.y;
+    let below = max(topM - py, 0.0);
+    if (below > 0.0) {
+      let pn = fbm2(xz * (1.0 / 520.0) + vec2f(F.camPos.w * 0.004, 1.0), 2) * 0.5 + 0.5;
+      let thick = F.mist.x * 0.0022 * smoothstep(0.5, 0.85, pn) * smoothstep(0.0, F.mist.y * 0.6, below);
+      let camIn = max(topM - F.camPos.y, 0.0);
+      let path = min((below - camIn) / max(V.y, 0.04), dist);
+      let Tm = exp(-thick * max(path, 0.0));
+      let cosT = dot(-V, lt.L);
+      let ph = mix(phaseHG(cosT, 0.6), phaseHG(cosT, -0.1), 0.5) * 4.0 * PI;
+      let mistCol = lt.sun * cloudSu * ph * 0.16 + (lt.zen * 0.6 + lt.hor * 0.4) * 0.9 + lt.moon * 0.3;
+      col = col * Tm + mistCol * (1.0 - Tm);
+    }
+  }
+  if (Rain.wind.w > 0.004) {
+    let snow = Rain.amt.y;
+    let thick = Rain.wind.w * mix(0.00042, 0.00018, snow);
+    let Tm = exp(-thick * dist);
+    let fogCol = mix(vec3f(0.58, 0.63, 0.7), vec3f(0.86, 0.89, 0.93), snow);
+    var litFog = (lt.zen * 0.62 + lt.hor * 0.38) * mix(0.5, 0.85, snow);
+    litFog += vec3f(0.62, 0.72, 0.95) * Rain.amt.z * 0.9;
+    col = col * Tm + fogCol * litFog * (1.0 - Tm);
+    if (Rain.bolt.w > 0.5) { col += vec3f(0.42, 0.52, 0.78) * Rain.amt.z * 0.6; }
+  }
+  let uv = in.pos.xy * F.screen.zw;
+  let zc = sqrt(dist * 0.001 / AP_MAX) * AP_N - 1.0;
+  let w = clamp(zc + 1.0, 0.0, 1.0);
+  let ap = textureSampleLevel(apTex, sampC, vec3f(uv, (max(zc, 0.0) + 0.5) / AP_N), 0.0);
+  let T = mix(1.0, ap.a, w);
+  col = col * T + ap.rgb * F.sunDir.w * w;
   return vec4f(col, 1.0);
 }
 `;
@@ -3914,6 +4239,8 @@ function createWeatherWidget(root, status, onObservation) {
 
 
 
+
+
 const qs = new URLSearchParams(location.search);
 const DBG = Number(qs.get('dbg')) || 0;
 const D2R = Math.PI / 180;
@@ -3936,7 +4263,7 @@ const P = {
   flightAltitude: 1,
   cameraTilt: 0,
   fov: 52,
-  forestDensity: 1,
+  forestDensity: 0.3,
   treeHeight: 1,
   mist: 1,
   renderScale: 1,
@@ -4067,15 +4394,15 @@ async function main() {
   async function shader(code, label) {
     const m = device.createShaderModule({ code, label });
     const info = await m.getCompilationInfo();
-    let bad = false;
+    let bad = false, first = '';
     for (const msg of info.messages) {
-      if (msg.type === 'error') bad = true;
+      if (msg.type === 'error') { bad = true; if (!first) first = ` ${msg.lineNum}:${msg.linePos} ${msg.message} | ${(code.split('\n')[msg.lineNum - 1] || '').trim().slice(0, 120)}`; }
       if (msg.type !== 'info') {
         const line = code.split('\n')[msg.lineNum - 1];
         log(`[${label}] ${msg.type} ${msg.lineNum}:${msg.linePos} ${msg.message}\n    ${line}`);
       }
     }
-    if (bad) fail('Shader compile error in ' + label + ' (see console)');
+    if (bad) fail('Shader compile error in ' + label + ':' + first);
     return m;
   }
   async function computePipe(code, label) {
@@ -4192,7 +4519,7 @@ async function main() {
   // --------------------------------------------------------------------------------------
   const MSAA = 1;
   const HDR = 'rgba16float';
-  const [landMod, skyMod, downMod, upMod, compMod, rainInitPipe, rainDropPipe, rainDrawMod, rainMistMod, shadowPipe, reflPipe] = await Promise.all([
+  const [landMod, skyMod, downMod, upMod, compMod, rainInitPipe, rainDropPipe, rainDrawMod, rainMistMod, shadowPipe, reflPipe, treeLightPipe, treeGenPipe, treeMod] = await Promise.all([
     shader(landWGSL(hasF32Filter), 'land'), shader(SKY_BG, 'sky'), shader(BLOOM_DOWN, 'bloom down'),
     shader(BLOOM_UP, 'bloom up'), shader(COMPOSITE, 'composite'),
     computePipe(RAIN_DROP_INIT, 'rain init'),
@@ -4201,6 +4528,9 @@ async function main() {
     shader(RAIN_MIST, 'rain mist'),
     computePipe(cloudShadowBakeWGSL(hasF32Filter), 'cloud shadow'),
     computePipe(skyReflectBakeWGSL(), 'sky reflect'),
+    computePipe(treeLightWGSL(), 'tree light'),
+    computePipe(treeGenWGSL(hasF32Filter), 'tree gen'),
+    shader(treeDrawWGSL(), 'trees'),
   ]);
   const PREMUL = {
     color: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
@@ -4214,18 +4544,27 @@ async function main() {
     },
     fragment: { module: landMod, entryPoint: 'fs', targets: [{ format: HDR }] },
     primitive: { topology: 'triangle-list', cullMode: 'none' },
-    depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'greater' },
+    depthStencil: { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'greater' },
     multisample: { count: MSAA },
   });
+  const treePipe = (far) => device.createRenderPipelineAsync({
+    label: far ? 'trees far' : 'trees near', layout: 'auto',
+    vertex: { module: treeMod, entryPoint: 'vs', constants: { FAR: far ? 1 : 0 } },
+    fragment: { module: treeMod, entryPoint: 'fs', targets: [{ format: HDR }] },
+    primitive: { topology: 'triangle-list', cullMode: 'none' },
+    depthStencil: { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'greater' },
+    multisample: { count: MSAA },
+  });
+  const [treeNearPipe, treeFarPipe] = await Promise.all([treePipe(false), treePipe(true)]);
   const skyPipe = await device.createRenderPipelineAsync({
     label: 'sky', layout: 'auto',
     vertex: { module: skyMod, entryPoint: 'vs' },
     fragment: { module: skyMod, entryPoint: 'fs', targets: [{ format: HDR }] },
     primitive: { topology: 'triangle-list' },
-    depthStencil: { format: 'depth32float', depthWriteEnabled: false, depthCompare: 'equal' },
+    depthStencil: { format: 'depth24plus', depthWriteEnabled: false, depthCompare: 'equal' },
     multisample: { count: MSAA },
   });
-  const rainDepth = { format: 'depth32float', depthWriteEnabled: false, depthCompare: 'greater' };
+  const rainDepth = { format: 'depth24plus', depthWriteEnabled: false, depthCompare: 'greater' };
   const rainDrawPipe = await device.createRenderPipelineAsync({
     label: 'rain draw', layout: 'auto',
     vertex: { module: rainDrawMod, entryPoint: 'vs' },
@@ -4239,7 +4578,7 @@ async function main() {
     vertex: { module: rainMistMod, entryPoint: 'vs' },
     fragment: { module: rainMistMod, entryPoint: 'fs', targets: [{ format: HDR, blend: PREMUL }] },
     primitive: { topology: 'triangle-list' },
-    depthStencil: { format: 'depth32float', depthWriteEnabled: false, depthCompare: 'always' },
+    depthStencil: { format: 'depth24plus', depthWriteEnabled: false, depthCompare: 'always' },
     multisample: { count: MSAA },
   });
   const rainF = new Float32Array(32);
@@ -4295,6 +4634,25 @@ async function main() {
   const bgLand = bg(landPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp, apView,
     arr(clipA), arr(clipB), { buffer: clipUBO }, { buffer: rainUBO },
     shadowView, { buffer: shadowUBO }, reflView, reflSamp], 'land');
+  // Instanced trees: a list written by a compute pass and drawn with two indirect draws.
+  const treeBuf = mkBuf(TREE_MAX * TREE_INST_BYTES, GU.STORAGE, 'trees');
+  const treeArgs = mkBuf(32, GU.STORAGE | GU.INDIRECT | GU.COPY_DST | GU.COPY_SRC, 'tree args');
+  const treeArgsRead = mkBuf(32, GU.MAP_READ | GU.COPY_DST, 'tree args read');
+  const treeLight = mkBuf(128, GU.STORAGE, 'tree light');
+  const treeGenUBO = mkBuf(16, GU.UNIFORM | GU.COPY_DST, 'tree gen');
+  const treeGenData = new ArrayBuffer(16);
+  const treeGenI = new Int32Array(treeGenData), treeGenU = new Uint32Array(treeGenData);
+  const treeArgsInit = new Uint32Array([TREE_VERTS_NEAR, 0, 0, 0, TREE_VERTS_FAR, 0, 0, 0]);
+  let treeArgsPending = false;
+  window.__trees = [0, 0];
+  const bgTreeLight = bg(treeLightPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp, { buffer: rainUBO }, { buffer: treeLight }], 'tree light');
+  const bgTreeGen = bg(treeGenPipe, [{ buffer: frameUBO }, sampClamp, arr(clipA), arr(clipB), { buffer: clipUBO },
+    shadowView, { buffer: shadowUBO }, { buffer: treeGenUBO }, { buffer: treeBuf }, { buffer: treeArgs }, { buffer: treeLight }], 'tree gen');
+  const treeEntries = [{ binding: 0, resource: { buffer: frameUBO } }, { binding: 2, resource: { buffer: treeBuf } },
+    { binding: 3, resource: apView }, { binding: 4, resource: sampClamp }, { binding: 5, resource: { buffer: rainUBO } },
+    { binding: 10, resource: { buffer: treeLight } }];
+  const bgTreeNear = device.createBindGroup({ label: 'trees near', layout: treeNearPipe.getBindGroupLayout(0), entries: treeEntries });
+  const bgTreeFar = device.createBindGroup({ label: 'trees far', layout: treeFarPipe.getBindGroupLayout(0), entries: treeEntries });
   const bgSky = bg(skyPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp, starView, { buffer: rainUBO }], 'sky');
   const bgRainInit = bg(rainInitPipe, [{ buffer: rainUBO }, { buffer: dropBuf }], 'rain init');
   const bgRainDrop = bg(rainDropPipe, [{ buffer: rainUBO }, { buffer: frameUBO }, { buffer: dropBuf }], 'rain drop');
@@ -4302,8 +4660,8 @@ async function main() {
   const bgRainMist = bg(rainMistPipe, [{ buffer: frameUBO }, { buffer: rainUBO }], 'rain mist');
 
   // CDLOD grid mesh
-  const GRID = 32;
-  const LEAF = 16.0;          // finest node size (m) -> 0.5 m vertex spacing
+  const GRID = 24;
+  const LEAF = 16.0;          // finest node size (m) -> about 0.7 m vertex spacing
   const R0 = 16 * LEAF;       // LOD 0 range
   const LODS = 10;
   const MAX_DIST = 110000;
@@ -4344,25 +4702,43 @@ async function main() {
   let paceHold = 0;
   let paceSeen = 0;
   let paceFresh = 0;
+  let paceRef = null;    // scale and GPU time before the last step down
+  let paceLock = 0;      // seconds left during which a step down is known not to help
+  let paceIdle = 0;      // consecutive checks with plenty of room
   let presentSharpen = 0;
+  // Dynamic resolution for slow GPUs. Most of this frame is terrain and tree geometry
+  // and fixed-size bakes that cost the same at any resolution, so a smaller picture is
+  // only kept when it measurably helps. Every resize reallocates the targets and changes
+  // the sharpness, so the controller moves rarely and in clear steps.
   function considerPace(dt) {
     if (!hasTS || gpuMs <= 0 || shotName) return;
     // The first frames bake every terrain level at once, so the early GPU time is not
     // the time the flight will actually run at.
     paceSeen += dt;
     if (paceSeen < 2.5) return;
+    if (paceLock > 0) paceLock -= dt;
     paceHold += dt;
-    if (paceHold < 0.8) return;
+    if (paceHold < 2) return;
     paceHold = 0;
     let next = paceScale;
-    // Aim under ~9 ms so a 60 Hz display still has idle time. Filling the whole refresh
-    // is what made the fans spin like a stress test.
-    if (gpuMs > 11) next = paceScale * Math.sqrt(9 / gpuMs);
-    else if (gpuMs < 7.5 && paceScale < 1) next = Math.min(1, paceScale * Math.sqrt(8.5 / gpuMs));
-    const stepDown = gpuMs > 20 ? 0.25 : 0.12;
-    next = Math.max(paceScale - stepDown, Math.min(paceScale + 0.08, next));
-    next = Math.max(0.5, Math.min(1, Math.round(next * 20) / 20));
+    if (paceRef) {
+      // judge the last step down: keep it only if it saved at least a tenth
+      if (gpuMs > paceRef.ms * 0.9) {
+        next = paceRef.s;
+        paceLock = 240;
+      }
+      paceRef = null;
+    } else if (gpuMs > 12 && paceScale > 0.5 && paceLock <= 0) {
+      paceRef = { s: paceScale, ms: gpuMs };
+      next = Math.max(0.5, paceScale - 0.15);
+    } else if (gpuMs < 6 && paceScale < 1) {
+      if (++paceIdle >= 3) next = Math.min(1, paceScale + 0.1);
+    } else {
+      paceIdle = 0;
+    }
+    next = Math.round(next * 20) / 20;
     if (next === paceScale) return;
+    paceIdle = 0;
     paceScale = next;
     // The running average was measured at the old resolution. Ignore it, and the
     // resize frame, before deciding whether another step is needed.
@@ -4413,7 +4789,7 @@ async function main() {
     canvas.width = W; canvas.height = H;
     for (const t of [colorMS, depthMS, hdrTex, bloomTex]) t && t.destroy();
     hdrTex = device.createTexture({ size: [W, H], format: HDR, usage: TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING });
-    depthMS = device.createTexture({ size: [W, H], format: 'depth32float', sampleCount: MSAA, usage: TU.RENDER_ATTACHMENT });
+    depthMS = device.createTexture({ size: [W, H], format: 'depth24plus', sampleCount: MSAA, usage: TU.RENDER_ATTACHMENT });
     const hdrView = hdrTex.createView();
     if (MSAA > 1) {
       colorMS = device.createTexture({ size: [W, H], format: HDR, sampleCount: MSAA, usage: TU.RENDER_ATTACHMENT });
@@ -4458,16 +4834,24 @@ async function main() {
   let tsQuery = null, tsResolve = null, tsRead = null, tsPending = false, gpuMs = 0;
   let firstPassTS = undefined;
   if (hasTS) {
-    tsQuery = device.createQuerySet({ type: 'timestamp', count: 2 });
-    tsResolve = mkBuf(16, GU.QUERY_RESOLVE | GU.COPY_SRC, 'ts resolve');
-    tsRead = mkBuf(16, GU.MAP_READ | GU.COPY_DST, 'ts read');
-    firstPassTS = { querySet: tsQuery, beginningOfPassWriteIndex: 0 };
-    compPass.timestampWrites = { querySet: tsQuery, endOfPassWriteIndex: 1 };
+    tsQuery = device.createQuerySet({ type: 'timestamp', count: 4 });
+    tsResolve = mkBuf(32, GU.QUERY_RESOLVE | GU.COPY_SRC, 'ts resolve');
+    tsRead = mkBuf(32, GU.MAP_READ | GU.COPY_DST, 'ts read');
+    firstPassTS = { querySet: tsQuery, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 };
+    mainPass.timestampWrites = { querySet: tsQuery, endOfPassWriteIndex: 2 };
+    compPass.timestampWrites = { querySet: tsQuery, endOfPassWriteIndex: 3 };
   }
   const computeDesc = { timestampWrites: firstPassTS };
+  // compute, main scene and post-processing (bloom + composite), smoothed, for profiling
+  const gpuSplit = [0, 0, 0];
+  window.__gpuSplit = gpuSplit;
   const onTsMapped = () => {
     const t = new BigUint64Array(tsRead.getMappedRange());
-    const ms = Number(t[1] - t[0]) / 1e6;
+    const ms = Number(t[3] - t[0]) / 1e6;
+    if (ms > 0 && ms < 1000) {
+      const parts = [Number(t[1] - t[0]) / 1e6, Number(t[2] - t[1]) / 1e6, Number(t[3] - t[2]) / 1e6];
+      for (let i = 0; i < 3; i++) gpuSplit[i] = gpuSplit[i] ? gpuSplit[i] * 0.8 + parts[i] * 0.2 : parts[i];
+    }
     if (paceFresh > 0) paceFresh--;
     else if (ms > 0 && ms < 1000) gpuMs = gpuMs ? gpuMs * 0.8 + ms * 0.2 : ms;
     tsRead.unmap();
@@ -5368,7 +5752,7 @@ async function main() {
   let rainCloudManual = null;
   let rainIntensityShown = '';
   let uiReady = false;
-  const SETTINGS_KEY = 'web-scenery-settings-v1';
+  const SETTINGS_KEY = 'web-scenery-settings-v2';
   const SECTIONS = [
     { title: 'General', groups: [
       { settings: [
@@ -6196,6 +6580,7 @@ async function main() {
     const single = P.sceneMode !== 'tour';
     setSettingVisible('scene', single);
     setSettingVisible('tourOrder', !single);
+    setSettingVisible('tourMinutes', !single);
     refreshModeGroups();
   }
   async function resolveZipCode() {
@@ -7043,7 +7428,8 @@ async function main() {
     shadowF[1] = Math.floor((cam.z - SHADOW_SPAN * 0.5) / shadowTexel) * shadowTexel;
     shadowF[2] = shadowTexel;
     shadowF[3] = SHADOW_SPAN;
-    device.queue.writeBuffer(shadowUBO, 0, shadowF);
+    // the readers must see the origin the map was baked at
+    if ((frameIndex & 3) === 0) device.queue.writeBuffer(shadowUBO, 0, shadowF);
     selectAll();
     if (nodeCount) device.queue.writeBuffer(instBuf, 0, instData, 0, nodeCount * 4);
 
@@ -7086,14 +7472,32 @@ async function main() {
     cp.dispatchWorkgroups(Math.ceil(AP_RES / 8), Math.ceil(AP_RES / 8));
     encodeRain(cp);
     // Cloud shadows and water reflections are baked at a fixed small size, so they do not
-    // get cheaper when the picture scales down. Every other frame is enough: both move slowly.
-    if ((frameIndex & 1) === 0) {
+    // get cheaper when the picture scales down. Both move slowly, so they take turns, each
+    // refreshed every fourth frame.
+    if ((frameIndex & 3) === 0) {
       cp.setPipeline(shadowPipe);
       cp.setBindGroup(0, bgShadow);
       cp.dispatchWorkgroups(SHADOW_N / 8, SHADOW_N / 8);
+    }
+    if ((frameIndex & 3) === 2) {
       cp.setPipeline(reflPipe);
       cp.setBindGroup(0, bgRefl);
       cp.dispatchWorkgroups(REFL_W / 8, REFL_H / 8);
+    }
+    {
+      const sp = Math.max(frameF[121], 1);
+      const dim = Math.ceil(2 * TREE_RANGE / sp) + 2;
+      treeGenI[0] = Math.floor((cam.x - TREE_RANGE) / sp);
+      treeGenI[1] = Math.floor((cam.z - TREE_RANGE) / sp);
+      treeGenU[2] = dim; treeGenU[3] = 0;
+      device.queue.writeBuffer(treeGenUBO, 0, treeGenData);
+      device.queue.writeBuffer(treeArgs, 0, treeArgsInit);
+      cp.setPipeline(treeLightPipe);
+      cp.setBindGroup(0, bgTreeLight);
+      cp.dispatchWorkgroups(1);
+      cp.setPipeline(treeGenPipe);
+      cp.setBindGroup(0, bgTreeGen);
+      cp.dispatchWorkgroups(Math.ceil(dim / TREE_GEN_GROUP), Math.ceil(dim / TREE_GEN_GROUP));
     }
     cp.end();
 
@@ -7105,6 +7509,12 @@ async function main() {
       rp.setIndexBuffer(idxBuf, 'uint16');
       rp.drawIndexed(GRID * GRID * 6, nodeCount);
     }
+    rp.setPipeline(treeNearPipe);
+    rp.setBindGroup(0, bgTreeNear);
+    rp.drawIndirect(treeArgs, 0);
+    rp.setPipeline(treeFarPipe);
+    rp.setBindGroup(0, bgTreeFar);
+    rp.drawIndirect(treeArgs, 16);
     rp.setPipeline(skyPipe);
     rp.setBindGroup(0, bgSky);
     rp.draw(3);
@@ -7146,10 +7556,15 @@ async function main() {
     pc.end();
 
     if (doProbe) enc.copyBufferToBuffer(probeOut, 0, probeRead, 0, PROBE_N * 4);
+    let doTreeRead = false;
+    if (!treeArgsPending && (frameIndex & 63) === 0) {
+      enc.copyBufferToBuffer(treeArgs, 0, treeArgsRead, 0, 32);
+      doTreeRead = true;
+    }
     let doTs = false;
     if (hasTS && !tsPending && (frameIndex & 7) === 0) {
-      enc.resolveQuerySet(tsQuery, 0, 2, tsResolve, 0);
-      enc.copyBufferToBuffer(tsResolve, 0, tsRead, 0, 16);
+      enc.resolveQuerySet(tsQuery, 0, 4, tsResolve, 0);
+      enc.copyBufferToBuffer(tsResolve, 0, tsRead, 0, 32);
       doTs = true;
     }
     let readBuf = null;
@@ -7162,6 +7577,15 @@ async function main() {
     submitList[0] = enc.finish();
     device.queue.submit(submitList);
     if (doProbe) { probePending = true; probeRead.mapAsync(GPUMapMode.READ).then(onProbe, onProbeFail); }
+    if (doTreeRead) {
+      treeArgsPending = true;
+      treeArgsRead.mapAsync(GPUMapMode.READ).then(() => {
+        const a = new Uint32Array(treeArgsRead.getMappedRange());
+        window.__trees = [a[1], a[5]];
+        treeArgsRead.unmap();
+        treeArgsPending = false;
+      }, () => { treeArgsPending = false; });
+    }
     if (doTs) { tsPending = true; tsRead.mapAsync(GPUMapMode.READ).then(onTsMapped, onTsFail); }
     if (readBuf) saveShot(readBuf, Math.ceil(W * 4 / 256) * 256);
     considerPace(dt);
@@ -7201,7 +7625,12 @@ async function main() {
   requestAnimationFrame(frame);
 }
 
-main().catch((e) => { log('init failed: ' + (e && e.stack || e)); });
+main().catch((e) => {
+  const msg = 'init failed: ' + (e && e.stack || e);
+  const el = document.getElementById('err');
+  if (el) { el.style.display = 'block'; el.textContent = msg; }
+  log(msg);
+});
 
 
 </script>

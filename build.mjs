@@ -11,7 +11,7 @@ import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
-const wgslModules = ['js/wgsl/common.js', 'js/wgsl/sky.js', 'js/wgsl/terrain.js', 'js/wgsl/forest.js', 'js/wgsl/rain.js', 'js/wgsl/land.js', 'js/wgsl/post.js'];
+const wgslModules = ['js/wgsl/common.js', 'js/wgsl/sky.js', 'js/wgsl/terrain.js', 'js/wgsl/forest.js', 'js/wgsl/rain.js', 'js/wgsl/land.js', 'js/wgsl/trees.js', 'js/wgsl/post.js'];
 const appModules = ['js/scenes.js', 'js/astronomy.js', 'js/star-catalog.js', 'js/place.js', 'js/weather.js'];
 const order = [...wgslModules, ...appModules, 'js/main.js'];
 const stripModuleSyntax = (src) => src

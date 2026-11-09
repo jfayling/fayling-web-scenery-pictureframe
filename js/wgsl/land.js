@@ -1,5 +1,5 @@
 // Landscape surface + sky background rendering.
-import { FRAME_WGSL, ATMO_CORE_WGSL, AP_RES, AP_MAX_KM } from './common.js';
+import { FRAME_WGSL, ATMO_CORE_WGSL, AP_RES, AP_MAX_KM, TREE_RANGE } from './common.js';
 import { SKY_RENDER_FUNCS, SKY_CLOUD_FUNCS } from './sky.js';
 import { TERRAIN_FUNCS, clipSampleWGSL } from './terrain.js';
 import { FOREST_FUNCS } from './forest.js';
@@ -73,20 +73,6 @@ struct VSOut {
   @location(1) xz: vec2f,      // world ground position
 };
 
-// Canopy height seen by the mesh: individual crowns while the grid can resolve them,
-// the stand's mean canopy height beyond. Both depend only on position and spacing.
-fn meshCanopy(xz: vec2f, dens: f32, eff: f32) -> f32 {
-  let sp = F.forest.y;
-  let mean = dens * F.forest.z * 0.62;
-  // Only the finest grid builds individual crowns. A 2 m vertex is already smaller
-  // than the canopy detail the fragment can show from the air, and evaluating a
-  // crown at every coarser vertex was most of the vertex cost.
-  let kNear = 1.0 - smoothstep(0.9, 1.8, eff);
-  if (kNear <= 0.0) { return mean; }
-  let c = canopyAt(xz, true, 0.0, 0.0);
-  return mix(mean, max(c.y, understoryH(dens)), kNear);
-}
-
 @vertex fn vs(@builtin(vertex_index) vi: u32, @location(0) inst: vec4f) -> VSOut {
   let n = u32(F.lodP.y);
   let g = vec2f(f32(vi % (n + 1u)), f32(vi / (n + 1u)));
@@ -102,9 +88,6 @@ fn meshCanopy(xz: vec2f, dens: f32, eff: f32) -> f32 {
   let h = clipHeight(xz, lv);
   let wl = waterLevel(xz.y);
   var y = max(h, wl);
-  if (h > wl + 0.2 && F.forest.x > 0.0) {
-    y += meshCanopy(xz, clipB2(xz, lv).x, eff);
-  }
   var o: VSOut;
   var rel = vec3f(xz.x, y, xz.y) - F.camPos.xyz;
   rel.y -= dot(rel.xz, rel.xz) / (2.0 * EARTH_R);
@@ -133,18 +116,20 @@ fn moonIlluminance() -> vec3f {
 fn terrainShadow(p: vec3f, L: vec3f) -> f32 {
   if (L.y > 0.8) { return 1.0; }
   let ceiling = waterLevel(p.z) + F.valley.w + F.relief.x * (1.5 - F.biome.z) + 40.0;
-  var t = 20.0;
+  var t = 30.0;
   var res = 1.0;
-  for (var i = 0; i < 12; i++) {
+  // Eight steps, stretching faster than the old twelve. The reach is the same few
+  // kilometres; the dropped samples were the expensive part of every landscape pixel.
+  for (var i = 0; i < 8; i++) {
     let q = p + L * t;
     if (q.y > ceiling) { break; }
-    let texel = max(t * 0.15, 20.0);
-    let lf = clamp(max(clipFinest(q.xz), log2(texel / CLIP_T0)), 0.0, f32(CLIP_L - 1));
+    let texel = max(t * 0.22, 24.0);
+    let lf = clamp(log2(texel / CLIP_T0), 0.0, f32(CLIP_L - 1));
     let h = clipHeight(q.xz, ceil(lf));
     let gap = q.y - h;
     res = min(res, gap / (t * 0.05) + 0.5);
     if (res <= 0.0) { return 0.0; }
-    t *= select(1.42, 1.7, i >= 4);
+    t *= 1.72;
   }
   return smoothstep(0.0, 1.0, res);
 }
@@ -184,7 +169,7 @@ fn direct(lt: Light, n: vec3f, sunVis: f32) -> vec3f {
 
 // Ground cover between and outside the trees.
 fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32, curv: f32) -> vec3f {
-  let n1 = fbm2(xz * (1.0 / 45.0) + vec2f(2.0, 9.0), select(3, 2, fp > 3.0));
+  let n1 = fbm2(xz * (1.0 / 45.0) + vec2f(2.0, 9.0), select(2, 1, fp > 6.0));
   let n2 = snoise(xz * (1.0 / 9.0) + vec2f(5.0, 1.0)) * (1.0 - smoothstep(2.0, 9.0, fp));
   let dry = F.forest2.x * 0.6 + smoothstep(-0.2, 0.4, n1) * 0.22;
   let trop = F.biome.w;
@@ -211,7 +196,7 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
     c = mix(c, sand, beach);
   }
   // rock: granite greys (dark basalt in the tropics), darker in clefts, lighter on ribs
-  if (rock > 0.02) {
+  if (rock > 0.02 && fp < 12.0) {
   let strata = snoise(vec2f((xz.x + xz.y) * 0.004, above * 0.09)) * 0.5 + 0.5;
   var rk = mix(vec3f(0.12, 0.115, 0.10), vec3f(0.19, 0.18, 0.16), strata);
   // weathered faces carry lichen and moss
@@ -342,11 +327,11 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
   } else {
     // ---- land ----
     let sp = F.forest.y;
-    // Individual crowns while they still read as a canopy. The fade used to wait until
-    // a crown was under a pixel, which kept the expensive path on the whole view.
-    let farK = smoothstep(0.38 * sp, 1.05 * sp, fp);
+    // The crowns are instanced trees (trees.js). The ground carries what is between and
+    // under them; once trees are too small to tell apart it carries the stand colour that
+    // the trees themselves fade to.
+    let farK = max(smoothstep(0.35 * sp, 1.0 * sp, fp), smoothstep(0.8 * ${TREE_RANGE}.0, ${TREE_RANGE}.0, dist));
     let gAlb = groundAlbedo(xz, fp, above, dens, M.z, M.w, curv);
-    // bumpy ground normal near the camera
     var Ng = Nt;
     if (fp < 4.0) {
       let b = gnoised(xz * (1.0 / 5.0) + vec2f(3.0, 3.0)).yz * 0.12 * (1.0 - smoothstep(1.0, 4.0, fp));
@@ -354,57 +339,17 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
     }
     // valleys and hollows collect less sky light
     let aoT = clamp(1.0 + curv * 4.0, 0.6, 1.0);
-    var crown: Canopy;
-    crown.hit = false;
-    let wantCrown = F.forest.x > 0.0 && dens > 0.02 && farK < 1.0;
-    // The stand mask at this pixel is enough once a crown is only a few pixels wide.
-    // Per-trunk mask lookups are kept for the foreground, where a clearing edge is visible.
-    if (wantCrown) { crown = canopyAt(xz, fp < 0.9, dens, conif); }
     var nearC = vec3f(0.0);
     if (farK < 1.0 && F.forest.x > 0.0) {
-      let c = crown;
       let uy = understoryH(dens);
-      if (c.hit && c.y > uy) {
-        let t = c.tree;
-        // crown texture: branch tufts on conifers, lumpy foliage clusters on broadleaves
-        let kd = 1.0 - smoothstep(0.08 * t.r, 0.45 * t.r, fp);
-        let bf = 1.0 / (t.r * select(0.3, 0.22, t.conifer));
-        // unrolled over the crown surface (radius plus drop from the apex), so the texture
-        // keeps its scale down the steep sides instead of smearing into vertical streaks
-        let dv = xz - t.pos;
-        let dl = max(length(dv), 1e-3);
-        let arc = dl + max(t.top - c.y, 0.0) * 0.8;
-        let q = dv * (arc / dl) * bf + vec2f(t.seed * 1.37, t.seed * 0.71);
-        let b1 = gnoised(q);
-        let b2 = gnoised(q * 2.3 + vec2f(5.1, 2.7));
-        let amp = (t.top - t.base) * select(0.16, 0.10, t.conifer) * kd;
-        let bump = (b1.yz + b2.yz * 2.3 * 0.5) * bf * amp;
-        let gw = grad + c.g + bump;
-        let nC = normalize(vec3f(-gw.x, 1.0, -gw.y));
-        let yb = c.y + (b1.x + b2.x * 0.5) * amp;
-        // deeper crown layers and the clefts between clusters see less sky
-        let depthK = clamp((yb - t.base) / max(t.top - t.base, 1.0), 0.0, 1.0);
-        let ao = (0.45 + 0.55 * depthK) * clamp(1.0 + (b1.x + 0.5 * b2.x) * 0.8 * kd, 0.5, 1.2) * aoT;
-        let sh = canopyShadow(xz, yb, lt.L, dens, conif, grad, fp);
-        let alb = treeAlbedo(t);
-        // foliage scatters forward: some sun comes through thin, backlit crown edges
-        let trans = select(0.35, 0.18, t.conifer) * max(-dot(nC, lt.L), 0.0) * (1.0 - depthK * 0.6);
-        let Hs = normalize(V + lt.L);
-        // leaf sheen, F0 about 0.03 spread over the microfacet lobe
-        let spec = select(0.010, 0.005, t.conifer) * ggx(max(dot(nC, Hs), 0.0), 0.5) * max(dot(nC, lt.L), 0.0)
-                 / max(dot(nC, V), 0.2);
-        nearC = alb * (direct(lt, nC, sh * sunVis) + lt.sun * sh * sunVis * trans + ambient(lt, nC) * ao)
-             + lt.sun * sh * sunVis * spec * PI;  // undone by the 1/pi applied to all land below
-      } else {
-        let sh = canopyShadow(xz, uy, lt.L, dens, conif, grad, fp);
-        // under and between crowns: little sky reaches the floor or the understory
-        let ao = mix(1.0, 0.28, smoothstep(0.0, 0.8, dens)) * aoT;
-        let uK = smoothstep(0.5, 2.0, uy);
-        let under = mix(standAlbedo(1.0), standAlbedo(conif), 0.4) * 0.75;
-        let alb = mix(gAlb, under, uK);
-        let n = normalize(mix(Ng, vec3f(0.0, 1.0, 0.0), uK));
-        nearC = alb * (direct(lt, n, sh * sunVis) + ambient(lt, n) * ao);
-      }
+      let sh = canopyShadow(uy, lt.L, dens);
+      // under and between crowns: little sky reaches the floor or the understory
+      let ao = mix(1.0, 0.28, smoothstep(0.0, 0.8, dens)) * aoT;
+      let uK = smoothstep(0.5, 2.0, uy);
+      let under = mix(standAlbedo(1.0), standAlbedo(conif), 0.4) * 0.75;
+      let alb = mix(gAlb, under, uK);
+      let n = normalize(mix(Ng, vec3f(0.0, 1.0, 0.0), uK));
+      nearC = alb * (direct(lt, n, sh * sunVis) + ambient(lt, n) * ao);
     }
     var farCol = vec3f(0.0);
     if (farK > 0.0 || F.forest.x <= 0.0) {
@@ -423,34 +368,7 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
                 + lt.moon * max(dot(standN, lt.M), 0.0) + ambient(lt, standN) * 0.7 * aoT);
       let gapLit = mix(1.0, lit * 0.35, closure);
       let floorC = gAlb * (direct(lt, Nt, sunVis * gapLit) + ambient(lt, Nt) * mix(1.0, 0.3, closure) * aoT);
-      let stat = mix(floorC, stand, closure);
-      farCol = stat;
-      // Open stands (snow, clearings) need the real trees, not a coarser stand-in.
-      // A clump grid splits as the camera advances, so new crowns appear in the gaps.
-      // Each distant mark is the tree that already occupies that cell.
-      let crownR = sp * mix(0.95, 0.48, conif);
-      let area = min(1.0, dens * 3.14159 * crownR * crownR / (sp * sp));
-      let dotK = 1.0 - smoothstep(0.72, 0.95, area);
-      if (dotK > 0.0 && dens > 0.02) {
-        let t = treeCell(vec2i(floor(xz / sp)), true, dens, conif);
-        var cov = 0.0;
-        if (t.ok) {
-          let rad = max(t.r, 0.5);
-          let d = length(xz - t.pos);
-          let aa = max(fp * 0.55, rad * 0.08);
-          let geom = 1.0 - smoothstep(rad - aa, rad + aa, d);
-          // While the crown is smaller than a pixel, tint its whole cell by the
-          // crown's area. The tree is already there; it only sharpens as it grows
-          // on screen. An empty cell stays snow, so nothing has to pop in later.
-          let cellCov = min(0.9, 3.14159 * rad * rad / (sp * sp));
-          let spread = smoothstep(0.4, 1.35, fp / rad);
-          cov = mix(geom, cellCov, spread);
-        }
-        let treeLit = standAlbedo(conif) * (lt.sun * sunVis * lit * crownCos * 0.9
-                    + lt.moon * max(dot(standN, lt.M), 0.0) + ambient(lt, standN) * 0.55 * aoT);
-        let openFloor = gAlb * (direct(lt, Nt, sunVis) + ambient(lt, Nt) * aoT);
-        farCol = mix(stat, mix(openFloor, treeLit, cov), dotK);
-      }
+      farCol = mix(floorC, stand, closure);
     }
     col = select(mix(nearC, farCol, farK), farCol, F.forest.x <= 0.0) * (1.0 / PI);
     // A water film darkens foliage and rock and lifts the leaf sheen.
@@ -466,7 +384,7 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
     let below = max(top - py, 0.0);
     if (below > 0.0) {
       // drifting banks of valley fog with clear gaps between them
-      let pn = fbm2(xz * (1.0 / 520.0) + vec2f(F.camPos.w * 0.004, 1.0), 4) * 0.5 + 0.5;
+      let pn = fbm2(xz * (1.0 / 520.0) + vec2f(F.camPos.w * 0.004, 1.0), 2) * 0.5 + 0.5;
       let thick = F.mist.x * 0.0022 * smoothstep(0.5, 0.85, pn) * smoothstep(0.0, F.mist.y * 0.6, below);
       let camIn = max(top - F.camPos.y, 0.0);
       let path = min((below - camIn) / max(V.y, 0.04), dist);

@@ -7,6 +7,12 @@ export const CLIP_RES = 512;   // terrain clipmap texels per side and level
 export const CLIP_LEVELS = 9;  // texel doubles per level: 2 m ... 512 m
 export const CLIP_TEXEL0 = 2;  // finest clipmap texel (m)
 export const PROBE_N = 32;     // terrain height probes for the flight controller
+// Trees are real instanced crowns out to TREE_RANGE. The near list uses the full cone,
+// the far list a cheaper one. Past the range the ground carries the stand colour.
+export const TREE_RANGE = 6000;
+export const TREE_NEAR_DIST = 1800;
+export const TREE_MAX = 900000;
+export const TREE_NEAR_MAX = 160000;
 
 // Per-frame uniform block shared by every render / sky / terrain shader.
 // Layout must match the Float32Array offsets in main.js (writeFrame).

@@ -7,6 +7,8 @@ import { SKY_W, SKY_H, AP_RES, CLIP_RES, CLIP_LEVELS, CLIP_TEXEL0, PROBE_N } fro
 import { TRANS_LUT, MS_LUT, SKYVIEW_LUT, AP_LUT, cloudShadowBakeWGSL, skyReflectBakeWGSL, SHADOW_N, SHADOW_SPAN, REFL_W, REFL_H } from './wgsl/sky.js';
 import { CLIP_HEIGHT, CLIP_DERIVE, HEIGHT_PROBE } from './wgsl/terrain.js';
 import { SKY_BG, landWGSL } from './wgsl/land.js';
+import { treeLightWGSL, treeGenWGSL, treeDrawWGSL, TREE_INST_BYTES, TREE_GEN_GROUP, TREE_VERTS_NEAR, TREE_VERTS_FAR } from './wgsl/trees.js';
+import { TREE_RANGE, TREE_MAX } from './wgsl/common.js';
 import { BLOOM_DOWN, BLOOM_UP, COMPOSITE } from './wgsl/post.js';
 import { RAIN_DROP_INIT, RAIN_DROP_UPDATE, RAIN_DRAW, RAIN_MIST, MAX_DROPS } from './wgsl/rain.js';
 import { SCENES, sceneUniforms } from './scenes.js';
@@ -37,7 +39,7 @@ export const P = {
   flightAltitude: 1,
   cameraTilt: 0,
   fov: 52,
-  forestDensity: 1,
+  forestDensity: 0.3,
   treeHeight: 1,
   mist: 1,
   renderScale: 1,
@@ -168,15 +170,15 @@ async function main() {
   async function shader(code, label) {
     const m = device.createShaderModule({ code, label });
     const info = await m.getCompilationInfo();
-    let bad = false;
+    let bad = false, first = '';
     for (const msg of info.messages) {
-      if (msg.type === 'error') bad = true;
+      if (msg.type === 'error') { bad = true; if (!first) first = ` ${msg.lineNum}:${msg.linePos} ${msg.message} | ${(code.split('\n')[msg.lineNum - 1] || '').trim().slice(0, 120)}`; }
       if (msg.type !== 'info') {
         const line = code.split('\n')[msg.lineNum - 1];
         log(`[${label}] ${msg.type} ${msg.lineNum}:${msg.linePos} ${msg.message}\n    ${line}`);
       }
     }
-    if (bad) fail('Shader compile error in ' + label + ' (see console)');
+    if (bad) fail('Shader compile error in ' + label + ':' + first);
     return m;
   }
   async function computePipe(code, label) {
@@ -293,7 +295,7 @@ async function main() {
   // --------------------------------------------------------------------------------------
   const MSAA = 1;
   const HDR = 'rgba16float';
-  const [landMod, skyMod, downMod, upMod, compMod, rainInitPipe, rainDropPipe, rainDrawMod, rainMistMod, shadowPipe, reflPipe] = await Promise.all([
+  const [landMod, skyMod, downMod, upMod, compMod, rainInitPipe, rainDropPipe, rainDrawMod, rainMistMod, shadowPipe, reflPipe, treeLightPipe, treeGenPipe, treeMod] = await Promise.all([
     shader(landWGSL(hasF32Filter), 'land'), shader(SKY_BG, 'sky'), shader(BLOOM_DOWN, 'bloom down'),
     shader(BLOOM_UP, 'bloom up'), shader(COMPOSITE, 'composite'),
     computePipe(RAIN_DROP_INIT, 'rain init'),
@@ -302,6 +304,9 @@ async function main() {
     shader(RAIN_MIST, 'rain mist'),
     computePipe(cloudShadowBakeWGSL(hasF32Filter), 'cloud shadow'),
     computePipe(skyReflectBakeWGSL(), 'sky reflect'),
+    computePipe(treeLightWGSL(), 'tree light'),
+    computePipe(treeGenWGSL(hasF32Filter), 'tree gen'),
+    shader(treeDrawWGSL(), 'trees'),
   ]);
   const PREMUL = {
     color: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
@@ -315,18 +320,27 @@ async function main() {
     },
     fragment: { module: landMod, entryPoint: 'fs', targets: [{ format: HDR }] },
     primitive: { topology: 'triangle-list', cullMode: 'none' },
-    depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'greater' },
+    depthStencil: { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'greater' },
     multisample: { count: MSAA },
   });
+  const treePipe = (far) => device.createRenderPipelineAsync({
+    label: far ? 'trees far' : 'trees near', layout: 'auto',
+    vertex: { module: treeMod, entryPoint: 'vs', constants: { FAR: far ? 1 : 0 } },
+    fragment: { module: treeMod, entryPoint: 'fs', targets: [{ format: HDR }] },
+    primitive: { topology: 'triangle-list', cullMode: 'none' },
+    depthStencil: { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'greater' },
+    multisample: { count: MSAA },
+  });
+  const [treeNearPipe, treeFarPipe] = await Promise.all([treePipe(false), treePipe(true)]);
   const skyPipe = await device.createRenderPipelineAsync({
     label: 'sky', layout: 'auto',
     vertex: { module: skyMod, entryPoint: 'vs' },
     fragment: { module: skyMod, entryPoint: 'fs', targets: [{ format: HDR }] },
     primitive: { topology: 'triangle-list' },
-    depthStencil: { format: 'depth32float', depthWriteEnabled: false, depthCompare: 'equal' },
+    depthStencil: { format: 'depth24plus', depthWriteEnabled: false, depthCompare: 'equal' },
     multisample: { count: MSAA },
   });
-  const rainDepth = { format: 'depth32float', depthWriteEnabled: false, depthCompare: 'greater' };
+  const rainDepth = { format: 'depth24plus', depthWriteEnabled: false, depthCompare: 'greater' };
   const rainDrawPipe = await device.createRenderPipelineAsync({
     label: 'rain draw', layout: 'auto',
     vertex: { module: rainDrawMod, entryPoint: 'vs' },
@@ -340,7 +354,7 @@ async function main() {
     vertex: { module: rainMistMod, entryPoint: 'vs' },
     fragment: { module: rainMistMod, entryPoint: 'fs', targets: [{ format: HDR, blend: PREMUL }] },
     primitive: { topology: 'triangle-list' },
-    depthStencil: { format: 'depth32float', depthWriteEnabled: false, depthCompare: 'always' },
+    depthStencil: { format: 'depth24plus', depthWriteEnabled: false, depthCompare: 'always' },
     multisample: { count: MSAA },
   });
   const rainF = new Float32Array(32);
@@ -396,6 +410,25 @@ async function main() {
   const bgLand = bg(landPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp, apView,
     arr(clipA), arr(clipB), { buffer: clipUBO }, { buffer: rainUBO },
     shadowView, { buffer: shadowUBO }, reflView, reflSamp], 'land');
+  // Instanced trees: a list written by a compute pass and drawn with two indirect draws.
+  const treeBuf = mkBuf(TREE_MAX * TREE_INST_BYTES, GU.STORAGE, 'trees');
+  const treeArgs = mkBuf(32, GU.STORAGE | GU.INDIRECT | GU.COPY_DST | GU.COPY_SRC, 'tree args');
+  const treeArgsRead = mkBuf(32, GU.MAP_READ | GU.COPY_DST, 'tree args read');
+  const treeLight = mkBuf(128, GU.STORAGE, 'tree light');
+  const treeGenUBO = mkBuf(16, GU.UNIFORM | GU.COPY_DST, 'tree gen');
+  const treeGenData = new ArrayBuffer(16);
+  const treeGenI = new Int32Array(treeGenData), treeGenU = new Uint32Array(treeGenData);
+  const treeArgsInit = new Uint32Array([TREE_VERTS_NEAR, 0, 0, 0, TREE_VERTS_FAR, 0, 0, 0]);
+  let treeArgsPending = false;
+  window.__trees = [0, 0];
+  const bgTreeLight = bg(treeLightPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp, { buffer: rainUBO }, { buffer: treeLight }], 'tree light');
+  const bgTreeGen = bg(treeGenPipe, [{ buffer: frameUBO }, sampClamp, arr(clipA), arr(clipB), { buffer: clipUBO },
+    shadowView, { buffer: shadowUBO }, { buffer: treeGenUBO }, { buffer: treeBuf }, { buffer: treeArgs }, { buffer: treeLight }], 'tree gen');
+  const treeEntries = [{ binding: 0, resource: { buffer: frameUBO } }, { binding: 2, resource: { buffer: treeBuf } },
+    { binding: 3, resource: apView }, { binding: 4, resource: sampClamp }, { binding: 5, resource: { buffer: rainUBO } },
+    { binding: 10, resource: { buffer: treeLight } }];
+  const bgTreeNear = device.createBindGroup({ label: 'trees near', layout: treeNearPipe.getBindGroupLayout(0), entries: treeEntries });
+  const bgTreeFar = device.createBindGroup({ label: 'trees far', layout: treeFarPipe.getBindGroupLayout(0), entries: treeEntries });
   const bgSky = bg(skyPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp, starView, { buffer: rainUBO }], 'sky');
   const bgRainInit = bg(rainInitPipe, [{ buffer: rainUBO }, { buffer: dropBuf }], 'rain init');
   const bgRainDrop = bg(rainDropPipe, [{ buffer: rainUBO }, { buffer: frameUBO }, { buffer: dropBuf }], 'rain drop');
@@ -403,8 +436,8 @@ async function main() {
   const bgRainMist = bg(rainMistPipe, [{ buffer: frameUBO }, { buffer: rainUBO }], 'rain mist');
 
   // CDLOD grid mesh
-  const GRID = 32;
-  const LEAF = 16.0;          // finest node size (m) -> 0.5 m vertex spacing
+  const GRID = 24;
+  const LEAF = 16.0;          // finest node size (m) -> about 0.7 m vertex spacing
   const R0 = 16 * LEAF;       // LOD 0 range
   const LODS = 10;
   const MAX_DIST = 110000;
@@ -445,25 +478,43 @@ async function main() {
   let paceHold = 0;
   let paceSeen = 0;
   let paceFresh = 0;
+  let paceRef = null;    // scale and GPU time before the last step down
+  let paceLock = 0;      // seconds left during which a step down is known not to help
+  let paceIdle = 0;      // consecutive checks with plenty of room
   let presentSharpen = 0;
+  // Dynamic resolution for slow GPUs. Most of this frame is terrain and tree geometry
+  // and fixed-size bakes that cost the same at any resolution, so a smaller picture is
+  // only kept when it measurably helps. Every resize reallocates the targets and changes
+  // the sharpness, so the controller moves rarely and in clear steps.
   function considerPace(dt) {
     if (!hasTS || gpuMs <= 0 || shotName) return;
     // The first frames bake every terrain level at once, so the early GPU time is not
     // the time the flight will actually run at.
     paceSeen += dt;
     if (paceSeen < 2.5) return;
+    if (paceLock > 0) paceLock -= dt;
     paceHold += dt;
-    if (paceHold < 0.8) return;
+    if (paceHold < 2) return;
     paceHold = 0;
     let next = paceScale;
-    // Aim under ~9 ms so a 60 Hz display still has idle time. Filling the whole refresh
-    // is what made the fans spin like a stress test.
-    if (gpuMs > 11) next = paceScale * Math.sqrt(9 / gpuMs);
-    else if (gpuMs < 7.5 && paceScale < 1) next = Math.min(1, paceScale * Math.sqrt(8.5 / gpuMs));
-    const stepDown = gpuMs > 20 ? 0.25 : 0.12;
-    next = Math.max(paceScale - stepDown, Math.min(paceScale + 0.08, next));
-    next = Math.max(0.5, Math.min(1, Math.round(next * 20) / 20));
+    if (paceRef) {
+      // judge the last step down: keep it only if it saved at least a tenth
+      if (gpuMs > paceRef.ms * 0.9) {
+        next = paceRef.s;
+        paceLock = 240;
+      }
+      paceRef = null;
+    } else if (gpuMs > 12 && paceScale > 0.5 && paceLock <= 0) {
+      paceRef = { s: paceScale, ms: gpuMs };
+      next = Math.max(0.5, paceScale - 0.15);
+    } else if (gpuMs < 6 && paceScale < 1) {
+      if (++paceIdle >= 3) next = Math.min(1, paceScale + 0.1);
+    } else {
+      paceIdle = 0;
+    }
+    next = Math.round(next * 20) / 20;
     if (next === paceScale) return;
+    paceIdle = 0;
     paceScale = next;
     // The running average was measured at the old resolution. Ignore it, and the
     // resize frame, before deciding whether another step is needed.
@@ -514,7 +565,7 @@ async function main() {
     canvas.width = W; canvas.height = H;
     for (const t of [colorMS, depthMS, hdrTex, bloomTex]) t && t.destroy();
     hdrTex = device.createTexture({ size: [W, H], format: HDR, usage: TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING });
-    depthMS = device.createTexture({ size: [W, H], format: 'depth32float', sampleCount: MSAA, usage: TU.RENDER_ATTACHMENT });
+    depthMS = device.createTexture({ size: [W, H], format: 'depth24plus', sampleCount: MSAA, usage: TU.RENDER_ATTACHMENT });
     const hdrView = hdrTex.createView();
     if (MSAA > 1) {
       colorMS = device.createTexture({ size: [W, H], format: HDR, sampleCount: MSAA, usage: TU.RENDER_ATTACHMENT });
@@ -559,16 +610,24 @@ async function main() {
   let tsQuery = null, tsResolve = null, tsRead = null, tsPending = false, gpuMs = 0;
   let firstPassTS = undefined;
   if (hasTS) {
-    tsQuery = device.createQuerySet({ type: 'timestamp', count: 2 });
-    tsResolve = mkBuf(16, GU.QUERY_RESOLVE | GU.COPY_SRC, 'ts resolve');
-    tsRead = mkBuf(16, GU.MAP_READ | GU.COPY_DST, 'ts read');
-    firstPassTS = { querySet: tsQuery, beginningOfPassWriteIndex: 0 };
-    compPass.timestampWrites = { querySet: tsQuery, endOfPassWriteIndex: 1 };
+    tsQuery = device.createQuerySet({ type: 'timestamp', count: 4 });
+    tsResolve = mkBuf(32, GU.QUERY_RESOLVE | GU.COPY_SRC, 'ts resolve');
+    tsRead = mkBuf(32, GU.MAP_READ | GU.COPY_DST, 'ts read');
+    firstPassTS = { querySet: tsQuery, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 };
+    mainPass.timestampWrites = { querySet: tsQuery, endOfPassWriteIndex: 2 };
+    compPass.timestampWrites = { querySet: tsQuery, endOfPassWriteIndex: 3 };
   }
   const computeDesc = { timestampWrites: firstPassTS };
+  // compute, main scene and post-processing (bloom + composite), smoothed, for profiling
+  const gpuSplit = [0, 0, 0];
+  window.__gpuSplit = gpuSplit;
   const onTsMapped = () => {
     const t = new BigUint64Array(tsRead.getMappedRange());
-    const ms = Number(t[1] - t[0]) / 1e6;
+    const ms = Number(t[3] - t[0]) / 1e6;
+    if (ms > 0 && ms < 1000) {
+      const parts = [Number(t[1] - t[0]) / 1e6, Number(t[2] - t[1]) / 1e6, Number(t[3] - t[2]) / 1e6];
+      for (let i = 0; i < 3; i++) gpuSplit[i] = gpuSplit[i] ? gpuSplit[i] * 0.8 + parts[i] * 0.2 : parts[i];
+    }
     if (paceFresh > 0) paceFresh--;
     else if (ms > 0 && ms < 1000) gpuMs = gpuMs ? gpuMs * 0.8 + ms * 0.2 : ms;
     tsRead.unmap();
@@ -1469,7 +1528,7 @@ async function main() {
   let rainCloudManual = null;
   let rainIntensityShown = '';
   let uiReady = false;
-  const SETTINGS_KEY = 'web-scenery-settings-v1';
+  const SETTINGS_KEY = 'web-scenery-settings-v2';
   const SECTIONS = [
     { title: 'General', groups: [
       { settings: [
@@ -2297,6 +2356,7 @@ async function main() {
     const single = P.sceneMode !== 'tour';
     setSettingVisible('scene', single);
     setSettingVisible('tourOrder', !single);
+    setSettingVisible('tourMinutes', !single);
     refreshModeGroups();
   }
   async function resolveZipCode() {
@@ -3144,7 +3204,8 @@ async function main() {
     shadowF[1] = Math.floor((cam.z - SHADOW_SPAN * 0.5) / shadowTexel) * shadowTexel;
     shadowF[2] = shadowTexel;
     shadowF[3] = SHADOW_SPAN;
-    device.queue.writeBuffer(shadowUBO, 0, shadowF);
+    // the readers must see the origin the map was baked at
+    if ((frameIndex & 3) === 0) device.queue.writeBuffer(shadowUBO, 0, shadowF);
     selectAll();
     if (nodeCount) device.queue.writeBuffer(instBuf, 0, instData, 0, nodeCount * 4);
 
@@ -3187,14 +3248,32 @@ async function main() {
     cp.dispatchWorkgroups(Math.ceil(AP_RES / 8), Math.ceil(AP_RES / 8));
     encodeRain(cp);
     // Cloud shadows and water reflections are baked at a fixed small size, so they do not
-    // get cheaper when the picture scales down. Every other frame is enough: both move slowly.
-    if ((frameIndex & 1) === 0) {
+    // get cheaper when the picture scales down. Both move slowly, so they take turns, each
+    // refreshed every fourth frame.
+    if ((frameIndex & 3) === 0) {
       cp.setPipeline(shadowPipe);
       cp.setBindGroup(0, bgShadow);
       cp.dispatchWorkgroups(SHADOW_N / 8, SHADOW_N / 8);
+    }
+    if ((frameIndex & 3) === 2) {
       cp.setPipeline(reflPipe);
       cp.setBindGroup(0, bgRefl);
       cp.dispatchWorkgroups(REFL_W / 8, REFL_H / 8);
+    }
+    {
+      const sp = Math.max(frameF[121], 1);
+      const dim = Math.ceil(2 * TREE_RANGE / sp) + 2;
+      treeGenI[0] = Math.floor((cam.x - TREE_RANGE) / sp);
+      treeGenI[1] = Math.floor((cam.z - TREE_RANGE) / sp);
+      treeGenU[2] = dim; treeGenU[3] = 0;
+      device.queue.writeBuffer(treeGenUBO, 0, treeGenData);
+      device.queue.writeBuffer(treeArgs, 0, treeArgsInit);
+      cp.setPipeline(treeLightPipe);
+      cp.setBindGroup(0, bgTreeLight);
+      cp.dispatchWorkgroups(1);
+      cp.setPipeline(treeGenPipe);
+      cp.setBindGroup(0, bgTreeGen);
+      cp.dispatchWorkgroups(Math.ceil(dim / TREE_GEN_GROUP), Math.ceil(dim / TREE_GEN_GROUP));
     }
     cp.end();
 
@@ -3206,6 +3285,12 @@ async function main() {
       rp.setIndexBuffer(idxBuf, 'uint16');
       rp.drawIndexed(GRID * GRID * 6, nodeCount);
     }
+    rp.setPipeline(treeNearPipe);
+    rp.setBindGroup(0, bgTreeNear);
+    rp.drawIndirect(treeArgs, 0);
+    rp.setPipeline(treeFarPipe);
+    rp.setBindGroup(0, bgTreeFar);
+    rp.drawIndirect(treeArgs, 16);
     rp.setPipeline(skyPipe);
     rp.setBindGroup(0, bgSky);
     rp.draw(3);
@@ -3247,10 +3332,15 @@ async function main() {
     pc.end();
 
     if (doProbe) enc.copyBufferToBuffer(probeOut, 0, probeRead, 0, PROBE_N * 4);
+    let doTreeRead = false;
+    if (!treeArgsPending && (frameIndex & 63) === 0) {
+      enc.copyBufferToBuffer(treeArgs, 0, treeArgsRead, 0, 32);
+      doTreeRead = true;
+    }
     let doTs = false;
     if (hasTS && !tsPending && (frameIndex & 7) === 0) {
-      enc.resolveQuerySet(tsQuery, 0, 2, tsResolve, 0);
-      enc.copyBufferToBuffer(tsResolve, 0, tsRead, 0, 16);
+      enc.resolveQuerySet(tsQuery, 0, 4, tsResolve, 0);
+      enc.copyBufferToBuffer(tsResolve, 0, tsRead, 0, 32);
       doTs = true;
     }
     let readBuf = null;
@@ -3263,6 +3353,15 @@ async function main() {
     submitList[0] = enc.finish();
     device.queue.submit(submitList);
     if (doProbe) { probePending = true; probeRead.mapAsync(GPUMapMode.READ).then(onProbe, onProbeFail); }
+    if (doTreeRead) {
+      treeArgsPending = true;
+      treeArgsRead.mapAsync(GPUMapMode.READ).then(() => {
+        const a = new Uint32Array(treeArgsRead.getMappedRange());
+        window.__trees = [a[1], a[5]];
+        treeArgsRead.unmap();
+        treeArgsPending = false;
+      }, () => { treeArgsPending = false; });
+    }
     if (doTs) { tsPending = true; tsRead.mapAsync(GPUMapMode.READ).then(onTsMapped, onTsFail); }
     if (readBuf) saveShot(readBuf, Math.ceil(W * 4 / 256) * 256);
     considerPace(dt);
@@ -3302,4 +3401,9 @@ async function main() {
   requestAnimationFrame(frame);
 }
 
-main().catch((e) => { log('init failed: ' + (e && e.stack || e)); });
+main().catch((e) => {
+  const msg = 'init failed: ' + (e && e.stack || e);
+  const el = document.getElementById('err');
+  if (el) { el.style.display = 'block'; el.textContent = msg; }
+  log(msg);
+});
