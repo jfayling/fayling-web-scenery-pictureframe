@@ -50,6 +50,7 @@ struct Frame {
   biome:   vec4f,      // rock exposure, wetland, basin depth (lakes), broadleaf style (0 temperate, 1 tropical)
   mist:    vec4f,      // valley mist density, mist top (m above water), canyon (0 valley, 1 plateau gorge), terrain seed
   water:   vec4f,      // water level at z = 0 (m), downstream slope, water tint (0 clear, 1 tannin), coast (0 inland, 1 shoreline)
+  falls:   vec4f,      // waterfall density (0 none), cliff run (m), spacing along the valley (m), width scale
 };
 `;
 

@@ -1,6 +1,6 @@
 # fayling-web-scenery-pictureframe
 
-A real-time aerial picture frame for a large screen, in the spirit of the Apple TV aerial screen savers. A camera glides a few hundred metres above the country — following a river valley, banking gently through the bends — and drifts from one region to the next: Cascade rainforest, a New England autumn, boreal lakes, an alpine valley, the Colorado Rockies, a tropical highland, a Pacific coastline, and the Grand Canyon. Everything is generated and lit on the GPU every frame; there are no photos, textures, or video.
+A real-time aerial picture frame for a large screen, in the spirit of the Apple TV aerial screen savers. A camera glides a few hundred metres above the country — following a river valley, banking gently through the bends — and drifts from one region to the next: Cascade rainforest, a New England autumn, boreal lakes, an alpine valley, the Colorado Rockies, a tropical highland, a Pacific coastline, the Grand Canyon, and a Fiordland valley of waterfalls. Everything is generated and lit on the GPU every frame; there are no photos, textures, or video.
 
 It is a sibling of [fayling-web-ocean-pictureframe](https://github.com/jfayling/fayling-web-ocean-pictureframe) and shares its renderer conventions: WebGPU with WGSL shaders, a physically based sky and aerial perspective (Hillaire), reverse-Z depth, HDR rendering with bloom and AgX tone mapping, and the same clock, weather, and sky widgets.
 
@@ -28,7 +28,7 @@ After editing anything under `js/`, run `npm run build` to regenerate both bundl
 
 ## The tour
 
-By default the frame tours all eight regions, about four minutes each, fading through black between them. Each region has its own landform, forest, water, flight altitude and speed, and a matching sky (sun height and direction, haze, clouds). A small label names the region as it fades in.
+By default the frame tours all nine regions, about four minutes each, fading through black between them. Each region has its own landform, forest, water, flight altitude and speed, and a matching sky (sun height and direction, haze, clouds). A small label names the region as it fades in.
 
 | Region | Character |
 |---|---|
@@ -40,6 +40,7 @@ By default the frame tours all eight regions, about four minutes each, fading th
 | Tropical Rainforest | Deeply gullied highlands under a closed broadleaf canopy with emergent crowns, a brown river and heavy mist |
 | Pacific Coast | A Big Sur shoreline: open ocean on one side of the view, beaches and cliffed headlands on the other, coastal forest rising behind |
 | Grand Canyon | A gorge in the Colorado Plateau: flat rims, stepped red and cream cliffs, temples, a silty river, and scattered juniper on the rim |
+| Waterfall Valley | A Fiordland trough: a river the full width of the valley, sheer walls, and waterfalls spilling from tarns along the rims |
 
 Settings → **Scenery** chooses between the tour (in order or shuffled) and a single region, how long each region lasts, and whether each region brings its own sky. `?scene=alpine` in the URL shows one region.
 

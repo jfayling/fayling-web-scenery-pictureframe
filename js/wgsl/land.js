@@ -95,6 +95,27 @@ struct VSOut {
     y = mix(max(h, wl), wl + sea.height, wet);
     shift = sea.chop * wet;
   }
+  if (F.falls.x > 0.0) {
+    let t = F.camPos.w;
+    if (h < wl) {
+      // The canyon river, plus the standing waves where a fall hits it.
+      y += sin(xz.y * 0.04 - t * 3.4) * 0.32 + sin(xz.x * 0.018 + xz.y * 0.03 - t * 1.7) * 0.2;
+      let fs = fallStream(xz);
+      if (fs.spray > 0.08) {
+        let ad = valleyAd(xz);
+        let wave = sin(ad * 0.22 - t * 7.2) * 1.15 + sin(ad * 0.07 - t * 3.2 + xz.y * 0.06) * 1.7;
+        y += wave * fs.spray;
+      }
+    } else {
+      let feed = rimFeed(xz);
+      if (feed.cover > 0.18) {
+        let surface = clipHeight(feed.axis, lv) + feed.depth - 0.35;
+        if (h < surface - 0.08) {
+          y = max(y, mix(h, surface, smoothstep(0.12, 0.78, feed.cover)));
+        }
+      }
+    }
+  }
   var o: VSOut;
   var rel = vec3f(xz.x + shift.x, y, xz.y + shift.y) - F.camPos.xyz;
   rel.y -= dot(rel.xz, rel.xz) / (2.0 * EARTH_R);
@@ -172,6 +193,31 @@ fn ambient(lt: Light, n: vec3f) -> vec3f {
 }
 fn direct(lt: Light, n: vec3f, sunVis: f32) -> vec3f {
   return lt.sun * sunVis * max(dot(n, lt.L), 0.0) + lt.moon * max(dot(n, lt.M), 0.0);
+}
+
+// Widen a stream when the pixel is larger than the thread, so distant falls stay a streak
+// instead of flickering out.
+fn fallCover(distN: f32, fp: f32) -> f32 {
+  if (distN > 5.5) { return 0.0; }
+  let edge = 1.0 + clamp(fp - 2.0, 0.0, 16.0) * 0.04;
+  return 1.0 - smoothstep(0.2 * edge, edge, distN);
+}
+
+fn shadeWaterfall(col: vec3f, xz: vec2f, cover: f32, lt: Light, sunVis: f32) -> vec3f {
+  if (cover < 0.03) { return col; }
+  let t = F.camPos.w;
+  let lip = F.valley.y + max(F.falls.y, 40.0);
+  // Metres down the face. Scrolling this is the water falling.
+  let travel = max(lip - valleyAd(xz), 0.0) - t * 28.0;
+  let n1 = snoise(vec2f(xz.y * 0.16, travel * 0.12));
+  let n2 = snoise(vec2f(xz.y * 0.34 + 2.4, travel * 0.21 + 1.7));
+  let pulse = 0.5 + 0.5 * sin(travel * 0.62 + n1);
+  let streak = smoothstep(0.02, 0.78, n1 * 0.5 + n2 * 0.35 + pulse * 0.5);
+  let irr = lt.sun * sunVis * 0.95 + ambient(lt, vec3f(0.0, 0.72, 0.16));
+  var foam = vec3f(0.74, 0.80, 0.82) * irr * (1.0 / PI);
+  // A continuous sheet, with brighter pulses traveling down it.
+  foam *= 0.58 + 0.75 * streak;
+  return mix(col, foam, clamp(cover * 0.94, 0.0, 0.98));
 }
 
 // Colorado Plateau sequence, as a fraction of the drop from rim to river.
@@ -253,6 +299,10 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
   rk *= clamp(1.0 + curv * 5.0, 0.55, 1.25) * (0.85 + 0.3 * n2);
   if (F.water.w > 0.5) { rk = mix(rk, rk * vec3f(1.25, 0.92, 0.72), 0.55); }
   c = mix(c, rk, rock);
+  } else if (rock > 0.02 && F.falls.x > 0.0) {
+    // The near rock tint stops at a few metres per pixel. Cliffs still need to read as stone
+    // from the air, or the falls sit on green hillside.
+    c = mix(c, vec3f(0.105, 0.10, 0.095), rock);
   }
   // lichen and scree tint above the treeline
   c = mix(c, vec3f(0.85, 0.87, 0.9), snow);
@@ -274,7 +324,21 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
   let curv = A.w;
   let Nt = normalize(vec3f(-grad.x, 1.0, -grad.y));
   let wl = waterLevel(xz.y);
-  let depth = wl - hT;
+  var depth = wl - hT;
+  var feeder = false;
+  var feedSpill = 0.0;
+  if (F.falls.x > 0.0 && hT > wl) {
+    let feed = rimFeed(xz);
+    if (feed.cover > 0.22) {
+      let surface = clipHeight(feed.axis, lf) + feed.depth - 0.35;
+      let column = surface - hT;
+      if (column > 0.25) {
+        depth = column;
+        feeder = true;
+        feedSpill = feed.spill;
+      }
+    }
+  }
   let above = -depth;
   let dens = M.x;
   let conif = M.y;
@@ -283,7 +347,9 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
   var lt: Light;
   lt.L = F.sunDir.xyz;
   lt.M = normalize(F.moonDir.xyz);
-  let ground = vec3f(xz.x, max(hT, wl), xz.y);
+  var gy = max(hT, wl);
+  if (feeder) { gy = hT + depth; }
+  let ground = vec3f(xz.x, gy, xz.y);
   let sunUp = smoothstep(-0.015, 0.02, lt.L.y);
   var sunVis = 0.0;
   var cloudSh = 1.0;
@@ -320,6 +386,7 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
     var sl = vec2f(0.0);
     var crest = 0.0;
     var waveH = 0.0;
+    var plunge = 0.0;
     if (ocean) {
       let sea = seaState(xz, t, max(fp * 1.4, 2.0), depth, true);
       sl = sea.slope;
@@ -332,6 +399,23 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
         let rip2 = gnoised(xz * (1.0 / 1.2) - wind * t * 1.35 + vec2f(2.2, 5.4));
         let det = 1.0 - smoothstep(2.5, 16.0, fp);
         sl += (rip.yz * 0.04 + rip2.yz * 0.02) * det;
+      }
+    } else if (F.falls.x > 0.0) {
+      let flow = vec2f(riverDX(xz.y) * 0.12, 1.0);
+      let r1 = gnoised(xz * (1.0 / 16.0) - flow * t * 0.5);
+      let r2 = gnoised(xz * (1.0 / 5.5) - flow * t * 1.2 + vec2f(1.4, t * 0.08));
+      sl = r1.yz * 0.06 + r2.yz * 0.045 * detail;
+      let fs = fallStream(xz);
+      plunge = fs.spray;
+      if (plunge > 0.04) {
+        let ad = valleyAd(xz);
+        let rip = gnoised(vec2f(xz.y * 0.05, ad * 0.08 - t * 1.8));
+        let rip2 = gnoised(vec2f(xz.y * 0.12 + 2.0, ad * 0.2 - t * 3.2));
+        sl += (rip.yz * 0.2 + rip2.yz * 0.12) * plunge;
+      }
+      if (feedSpill > 0.02) {
+        let rush = gnoised(vec2f(xz.x * 0.07 + t * 2.6, xz.y * 0.09));
+        sl += rush.yz * 0.1 * feedSpill;
       }
     } else {
       var flow = vec2f(0.0);
@@ -348,7 +432,7 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
     // unresolved ripples widen the sun glint with distance. The swell is a few long
     // trains, so the ocean's glitter is a little broader than a river's or it locks
     // into hard dashes on every crest.
-    let rough = select(0.05, 0.1, ocean) + 0.12 * smoothstep(0.5, 30.0, fp) + wet * 0.14;
+    let rough = select(0.05, 0.1, ocean) + 0.12 * smoothstep(0.5, 30.0, fp) + wet * 0.14 + plunge * 0.22;
     let NdV = max(dot(n, V), 1e-3);
     var Fr = schlick(NdV, 0.02);
     var R = reflect(-V, n);
@@ -384,6 +468,18 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
       // sandy aprons stay clear enough to show the bottom; cliff water goes dark sooner
       extK = mix(vec3f(0.22, 0.07, 0.045), vec3f(0.10, 0.032, 0.022), sandy);
     }
+    if (F.falls.x > 0.0) {
+      if (feeder) {
+        deep = vec3f(0.012, 0.045, 0.05);
+        bed = vec3f(0.30, 0.34, 0.32);
+        extK = vec3f(0.15, 0.06, 0.045);
+      } else {
+        // The canyon river. Clear enough that the plunge foam stays the bright part.
+        deep = vec3f(0.012, 0.034, 0.036);
+        bed = vec3f(0.24, 0.28, 0.26);
+        extK = vec3f(0.26, 0.12, 0.09);
+      }
+    }
     let path = depth * (1.0 + 1.0 / max(V.y, 0.15));
     let ext = exp(-path * extK);
     let lit = lt.sun * sunVis * max(lt.L.y, 0.0) + ambient(lt, vec3f(0.0, 1.0, 0.0));
@@ -398,6 +494,20 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
       let mask = clamp(crest * mix(0.55, 1.0, lace), 0.0, 1.0);
       let foam = vec3f(0.76, 0.82, 0.86) * (lt.hor * 0.7 + lt.zen * 0.35 + lt.sun * sunVis * 0.25);
       col = mix(col, foam, mask * 0.92);
+    }
+    if (F.falls.x > 0.0 && !ocean) {
+      if (plunge > 0.16) {
+        let boil = snoise(vec2f(xz.y * 0.1 + t * 0.85, valleyAd(xz) * 0.14 - t * 2.8));
+        let lace = 0.62 + 0.38 * smoothstep(-0.15, 0.8, boil);
+        let froth = smoothstep(0.16, 0.48, plunge) * lace;
+        let foam = vec3f(0.8, 0.86, 0.88) * (lt.hor * 0.7 + lt.zen * 0.35 + lt.sun * sunVis * 0.4);
+        col = mix(col, foam, froth);
+      }
+      if (feedSpill > 0.04) {
+        let rush = 0.5 + 0.5 * sin(valleyAd(xz) * 0.45 + t * 9.0);
+        let foam = vec3f(0.78, 0.84, 0.86) * (lt.hor * 0.65 + lt.sun * sunVis * 0.35);
+        col = mix(col, foam, feedSpill * (0.4 + 0.45 * rush));
+      }
     }
   } else {
     // ---- land ----
@@ -450,6 +560,17 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
     col *= mix(1.0, 0.72, wet);
     let sheen = pow(max(dot(normalize(V + lt.L), Ng), 0.0), 18.0) * wet * sunVis;
     col += lt.sun * sheen * 0.015;
+  }
+
+  if (F.falls.x > 0.0 && depth <= 0.0) {
+    let fall = fallStream(xz);
+    let cover = fallCover(fall.distN, fp);
+    if (cover > 0.03) { col = shadeWaterfall(col, xz, cover, lt, sunVis); }
+    if (fall.spray > 0.4) {
+      let boil = 0.5 + 0.5 * snoise(vec2f(xz.y * 0.14 + F.camPos.w * 0.9, valleyAd(xz) * 0.2 - F.camPos.w * 3.2));
+      let foam = vec3f(0.84, 0.89, 0.91) * (lt.hor * 0.75 + lt.sun * sunVis * 0.5);
+      col = mix(col, foam, smoothstep(0.4, 0.85, fall.spray) * (0.65 + 0.35 * boil));
+    }
   }
 
   // ---- valley mist ----

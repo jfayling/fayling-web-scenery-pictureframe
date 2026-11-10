@@ -1,5 +1,5 @@
 // Procedural landscape: eroded mountains, a meandering river valley, a one-sided coastline,
-// a plateau canyon, lake basins, and the vegetation / rock / snow masks that go with them. The height function is baked into
+// a plateau canyon, hanging waterfalls, lake basins, and the vegetation / rock / snow masks that go with them. The height function is baked into
 // camera-centred clipmaps (one 512² layer per level, texel doubling per level) and the
 // renderer samples those instead of re-evaluating the noise per pixel.
 import { FRAME_WGSL, NOISE_WGSL, CLIP_RES, CLIP_LEVELS, CLIP_TEXEL0, PROBE_N } from './common.js';
@@ -211,7 +211,17 @@ fn mountainField(xz: vec2f, texel: f32) -> f32 {
   let x = max((h + 0.5) / 1.1, 0.0);
   var m = 1.25 * x * x / (x + 0.25);
   // gullies: strongest on mid and upper slopes, absent on the valley floors
-  let gs = F.relief.w * smoothstep(0.12, 0.45, m);
+  var gs = F.relief.w * smoothstep(0.12, 0.45, m);
+  // Waterfall cliffs: gullies follow the downhill direction, which on a steep face is straight
+  // down it, so they would read as vertical stripes between the falls. Keep them off the face.
+  if (F.falls.x > 0.0 && F.valley.x > 0.0) {
+    let foot = F.valley.y;
+    let cliffRun = max(F.falls.y, 40.0);
+    let wa = valleyAd(xz);
+    let face = smoothstep(foot - 20.0, foot + cliffRun * 0.1, wa)
+             * (1.0 - smoothstep(foot + cliffRun * 0.9, foot + cliffRun * 1.3, wa));
+    gs *= 1.0 - 0.92 * face;
+  }
   if (gs > 0.0) {
     let dir = vec2f(g.y, -g.x);
     var e = vec3f(0.0);
@@ -460,6 +470,167 @@ fn canyonHeight(xz: vec2f, texel: f32, wl: f32) -> f32 {
   return h;
 }
 
+// How far a waterfall wall shifts sideways, in metres. Positive bows the wall outward.
+fn valleyBow(z: f32, across: f32) -> f32 {
+  let side = select(1.3, 7.7, across >= 0.0);
+  return snoise(vec2f(z * 0.00026, side)) * 55.0
+       + snoise(vec2f(z * 0.00085, side + 3.0)) * 24.0
+       + snoise(vec2f(z * 0.0022, side + 8.0)) * 9.0;
+}
+
+// Absolute distance from the valley axis. Waterfall walls bow in and out so the
+// face is a series of alcoves and buttresses rather than one flat curtain.
+fn valleyAd(xz: vec2f) -> f32 {
+  let z = xz.y;
+  let s = valleyDX(z);
+  let across = (xz.x - valleyX(z)) * inverseSqrt(1.0 + s * s);
+  var ad = abs(across);
+  if (F.falls.x <= 0.0) { return ad; }
+  let k = smoothstep(90.0, F.valley.y * 0.8, ad);
+  return max(ad - valleyBow(z, across) * k, 0.0);
+}
+
+// Broad shape of the mountains, used to level a pool across its width.
+fn coarseRim(xz: vec2f) -> f32 {
+  let p = xz / max(F.relief.z, 400.0);
+  return snoise(p) * 0.55 + snoise(p * 2.1 + vec2f(3.0, 1.2)) * 0.3;
+}
+
+// 0 on the valley floor, 1 once the mountains have reached full height.
+fn valleyShape(ad: f32) -> f32 {
+  if (F.falls.x > 0.0) {
+    // Most of the drop is a steep wall just outside the meadow. The peaks keep climbing behind it.
+    // The drop is spread across the whole cliff run so the face stays a slope the clipmaps can resolve.
+    let cliff = max(F.falls.y, 40.0);
+    let foot = F.valley.y;
+    let u = clamp((ad - foot) / cliff, 0.0, 1.0);
+    // Steep at the waterline, then easing toward the rim, so the river meets rock.
+    let s = 1.0 - pow(1.0 - clamp(u / 0.88, 0.0, 1.0), 1.55);
+    let above = smoothstep(foot + cliff, foot + cliff + F.valley.x, ad);
+    let upper = above * above * (1.6 - 0.6 * above);
+    return s * 0.68 + upper * 0.32;
+  }
+  let wall = smoothstep(F.valley.y, F.valley.y + F.valley.x, ad);
+  return wall * wall * (1.6 - 0.6 * wall);
+}
+
+fn fallHash(cell: i32, salt: i32) -> f32 {
+  let h = pcgHash(u32(cell) ^ pcgHash(u32(salt) + seedU()));
+  return f32(h & 0xFFFFu) * (1.0 / 65535.0);
+}
+
+struct Fall {
+  distN: f32,   // stream-widths from the falling thread
+  along: f32,   // 0 at the river, 1 at the lip
+  dig: f32,     // metres to lower the cliff behind the thread
+  spray: f32,   // 0..1 plunge froth, including out onto the river
+};
+
+// The river that runs just inland of each brink, swelling into a tarn where a
+// fall spills. cover is 0..1, depth is the centre depth in metres, spill is 1
+// where that water is going over the lip. axis is the world point the pool is
+// levelled to.
+struct Feed {
+  cover: f32,
+  depth: f32,
+  spill: f32,
+  axis: vec2f,
+};
+
+fn fallStream(xz: vec2f) -> Fall {
+  var o: Fall;
+  o.distN = 9.0;
+  if (F.falls.x <= 0.001 || F.valley.x <= 0.0) { return o; }
+  let z = xz.y;
+  let slope = valleyDX(z);
+  let across = (xz.x - valleyX(z)) * inverseSqrt(1.0 + slope * slope);
+  let side = i32(select(-1.0, 1.0, across >= 0.0));
+  let ad = abs(across);
+  let foot = F.valley.y;
+  let cliff = max(F.falls.y, 40.0);
+  let lip = foot + cliff;
+  if (ad > lip + cliff + 80.0) { return o; }
+  let spacing = max(F.falls.z, 80.0);
+  let stagger = select(0.0, spacing * 0.5, side > 0);
+  let cell = i32(floor((z + stagger) / spacing));
+  let h0 = fallHash(cell, side);
+  if (h0 > F.falls.x) { return o; }
+  let h1 = fallHash(cell, side + 3);
+  let center = (f32(cell) + 0.5) * spacing + (h0 - 0.5) * spacing * 0.62 - stagger;
+  let wad = valleyAd(xz);
+  let along = clamp((wad - foot) / max(cliff, 1.0), 0.0, 1.0);
+  let wander = sin(along * 5.1 + f32(cell) * 1.9) * mix(4.0, 22.0, along);
+  let dz = z - (center + wander);
+  let sheet = smoothstep(0.32, 0.95, h1);
+  let baseW = mix(11.0, 34.0, sheet) * max(F.falls.w, 0.3);
+  let split = step(0.58, h1) * step(h1, 0.84) * baseW * 1.35;
+  let width = baseW * mix(0.75, 1.35, along);
+  var distN = min(abs(dz), abs(dz - split)) / max(width, 2.0);
+  // The white thread lives on the wall. Above the lip the supplying river takes over.
+  let onFall = smoothstep(foot - 4.0, foot + cliff * 0.05, wad) * (1.0 - smoothstep(lip - 12.0, lip + 8.0, wad));
+  distN = distN / max(onFall, 0.08);
+  let narrow = 1.0 - smoothstep(0.12, 1.0, distN);
+  let cliffK = smoothstep(0.12, 0.34, along) * (1.0 - smoothstep(0.72, 0.96, along));
+  // The boil sits on the waterline, which is partway up the cliff run.
+  let shore = foot + cliff * 0.3;
+  let core = exp(-max(shore - wad, 0.0) / 64.0) * exp(-max(wad - shore, 0.0) / 26.0)
+           * exp(-abs(dz) / (baseW * 1.25));
+  let ring = exp(-max(shore - wad, 0.0) / 95.0) * exp(-max(wad - shore, 0.0) / 32.0)
+           * exp(-abs(dz) / (baseW * 2.2)) * 0.55;
+  o.distN = distN;
+  o.along = along;
+  o.dig = narrow * onFall * (2.0 + cliffK * 11.0);
+  o.spray = max(core, ring);
+  return o;
+}
+
+fn rimFeed(xz: vec2f) -> Feed {
+  var o: Feed;
+  o.axis = xz;
+  if (F.falls.x <= 0.001 || F.valley.x <= 0.0) { return o; }
+  let z = xz.y;
+  let s = valleyDX(z);
+  let across = (xz.x - valleyX(z)) * inverseSqrt(1.0 + s * s);
+  let raw = abs(across);
+  let foot = F.valley.y;
+  let cliff = max(F.falls.y, 40.0);
+  let lip = foot + cliff;
+  if (raw < lip - 160.0 || raw > lip + 480.0) { return o; }
+  let sideSign = select(-1.0, 1.0, across >= 0.0);
+  let side = i32(sideSign);
+  let spacing = max(F.falls.z, 80.0);
+  let stagger = select(0.0, spacing * 0.5, side > 0);
+  let cell = i32(floor((z + stagger) / spacing));
+  let h0 = fallHash(cell, side);
+  let h1 = fallHash(cell, side + 11);
+  let present = select(0.0, 1.0, h0 <= F.falls.x);
+  let centerZ = (f32(cell) + 0.5) * spacing + (fallHash(cell, side + 2) - 0.5) * spacing * 0.55 - stagger;
+  let dz = z - centerZ;
+  let bow = valleyBow(z, across);
+  let wad = valleyAd(xz);
+  let wander = sin(z * 0.0031 + sideSign) * 12.0 + sin(z * 0.008 + 2.0) * 5.0;
+  // Inland of the brink, in the same warped measure the cliff is built with.
+  let axisWarped = lip + 90.0 + wander;
+  let tarnR = mix(70.0, 180.0, h1);
+  let tarn = present * (1.0 - smoothstep(tarnR * 0.4, tarnR, abs(dz)));
+  let halfW = mix(36.0, mix(70.0, 130.0, h1), tarn);
+  let d = abs(wad - axisWarped) / halfW;
+  var cover = 1.0 - smoothstep(0.2, 1.02, d);
+  let fallW = mix(16.0, 40.0, smoothstep(0.28, 0.92, h1));
+  let tongue = present
+    * (1.0 - smoothstep(fallW * 0.65, fallW * 1.5, abs(dz)))
+    * smoothstep(lip - 6.0, lip + 16.0, wad)
+    * (1.0 - smoothstep(axisWarped - halfW * 0.15, axisWarped + 8.0, wad));
+  cover = max(cover, tongue);
+  if (cover <= 0.001) { return o; }
+  let axisRaw = axisWarped + bow;
+  o.axis = vec2f(valleyX(z) + sideSign * axisRaw * sqrt(1.0 + s * s), z);
+  o.cover = cover;
+  o.depth = mix(3.6, 8.5, max(tarn, tongue * 0.45));
+  o.spill = tongue * (1.0 - smoothstep(lip + 4.0, lip + 48.0, wad));
+  return o;
+}
+
 // Terrain height in metres.
 fn terrainHeight(xz: vec2f, texel: f32) -> f32 {
   let z = xz.y;
@@ -468,11 +639,10 @@ fn terrainHeight(xz: vec2f, texel: f32) -> f32 {
   let m = mountainField(xz, texel);
   if (F.water.w > 0.5) { return coastHeight(xz, texel, m, wl); }
   var shape = 1.0;
+  var ad = 0.0;
   if (F.valley.x > 0.0) {
-    let s = valleyDX(z);
-    let ad = abs(xz.x - valleyX(z)) * inverseSqrt(1.0 + s * s);
-    let wall = smoothstep(F.valley.y, F.valley.y + F.valley.x, ad);
-    shape = wall * wall * (1.6 - 0.6 * wall);
+    ad = valleyAd(xz);
+    shape = valleyShape(ad);
   }
   // fine ground relief: hummocks, terraces and old channels on every floor
   var micro = 0.0;
@@ -488,10 +658,21 @@ fn terrainHeight(xz: vec2f, texel: f32) -> f32 {
     let cut = base - (1.0 - shape) * F.relief.x * 0.85;
     let floorRise = (1.0 - shape) * max(m - F.biome.z, 0.0) * 14.0;
     let a = cut - floorRise;
-    h = wl + F.valley.w + floorRise + 0.5 * (a + sqrt(a * a + 900.0)) + micro;
+    // A tighter blend keeps the waterfall cliffs from rounding off into ramps.
+    let soft = select(900.0, 160.0, F.falls.x > 0.0);
+    h = wl + F.valley.w + floorRise + 0.5 * (a + sqrt(a * a + soft)) + micro;
   }
-  // river channel
-  if (F.valley.z > 0.0) {
+  // river channel. A waterfall valley floods the whole floor instead of cutting one thread.
+  if (F.falls.x > 0.0 && ad > 0.0) {
+    let foot = F.valley.y;
+    let cliff = max(F.falls.y, 40.0);
+    if (ad < foot + cliff * 0.34 + 6.0) {
+      let u = clamp(ad / max(foot, 1.0), 0.0, 1.0);
+      var bed = wl - mix(9.0, 2.2, u * u);
+      if (texel < 20.0) { bed += snoise(xz * 0.008) * 0.7; }
+      h = min(h, bed);
+    }
+  } else if (F.valley.z > 0.0) {
     let rw = riverHalfWidth(z);
     let ar = abs(riverOffset(xz));
     let x = ar / rw;
@@ -502,6 +683,30 @@ fn terrainHeight(xz: vec2f, texel: f32) -> f32 {
     let bankH = wl + mix(2.8, 0.45, barK) + 1.8 * smoothstep(1.0, 3.2, x);
     h = mix(h, min(h, bankH), 1.0 - smoothstep(2.2, 5.5, x));
     h = mix(min(h, bed), h, smoothstep(0.8, 1.12, x));
+  }
+  if (F.falls.x > 0.0) {
+    let feed = rimFeed(xz);
+    if (feed.cover > 0.0) {
+      // Level the pool to the rim at its centre, so it reads as a lake rather than a wet slope.
+      let adHere = valleyAd(xz);
+      let adAxis = valleyAd(feed.axis);
+      let delta = (valleyShape(adHere) - valleyShape(adAxis)) * F.relief.x * 0.85
+                + (coarseRim(xz) - coarseRim(feed.axis)) * F.relief.x * 0.28;
+      let bed = min(h, h - delta - feed.depth);
+      h = mix(h, bed, feed.cover);
+    }
+    h -= fallStream(xz).dig;
+    // Ledges on the wall. They run level across the face: a height that varies with z
+    // alone would stack into vertical stripes on a steep wall. Both terms fade out with
+    // texel size instead of switching off at a clip-level boundary, so no rings show.
+    let cliff = max(F.falls.y, 40.0);
+    let onWall = smoothstep(F.valley.y + cliff * 0.08, F.valley.y + cliff * 0.22, ad)
+               * (1.0 - smoothstep(F.valley.y + cliff * 0.78, F.valley.y + cliff * 0.96, ad));
+    if (onWall > 0.0 && texel < 96.0) {
+      let ledge = snoise(vec2f(z * 0.0014, ad * 0.0075)) * 7.0
+                + snoise(vec2f(z * 0.0042, ad * 0.024) + vec2f(2.6, 0.0)) * 2.2 * (1.0 - smoothstep(6.0, 16.0, texel));
+      h += ledge * onWall * (1.0 - smoothstep(48.0, 96.0, texel));
+    }
   }
   return h;
 }
@@ -682,6 +887,21 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     rock = mix(rock, 0.32, rim * (1.0 - cliff));
     rock = clamp(rock * F.biome.x, 0.0, 1.0);
     snow = 0.0;
+  }
+
+  if (F.falls.x > 0.0 && F.mist.z < 0.5 && F.water.w < 0.5) {
+    let fs = fallStream(xz);
+    let cover = 1.0 - smoothstep(0.25, 1.05, fs.distN);
+    dens *= 1.0 - cover * 0.96;
+    rock = max(rock, cover * smoothstep(0.5, 1.4, slope) * 0.9);
+    snow *= 1.0 - cover * 0.8;
+    let adw = valleyAd(xz);
+    let toe = smoothstep(F.valley.y + max(F.falls.y, 40.0) * 0.4, F.valley.y + max(F.falls.y, 40.0) * 0.58, adw);
+    dens *= toe;
+    rock = max(rock, (1.0 - toe) * 0.8);
+    let feed = rimFeed(xz);
+    dens *= 1.0 - smoothstep(0.08, 0.6, feed.cover);
+    snow *= 1.0 - smoothstep(0.2, 0.8, feed.cover);
   }
 
   textureStore(dstA, id.xy, u32(B.level), vec4f(h, grad, lap));

@@ -1,5 +1,5 @@
 // Region presets for the aerial tour. Each scene sets the landform, the forest, the water
-// and a matching sky. sceneUniforms() packs a scene into the Frame floats 100..139 (see
+// and a matching sky. sceneUniforms() packs a scene into the Frame floats 100..143 (see
 // FRAME_WGSL) and returns JS mirrors of the valley path functions in wgsl/terrain.js so
 // the flight follows the same valley the shaders carve.
 
@@ -144,6 +144,24 @@ export const SCENES = [
     flight: { agl: 480, speed: 64, pitch: -11, fov: 56 },
     sky: { sunElev: 27, sunAzim: 104, haze: 0.55, clouds: 0.06, cloudAltitude: 7.2, veil: 0.04 },
   },
+  {
+    id: 'falls',
+    name: 'Waterfall Valley',
+    place: 'Fiordland, New Zealand',
+    seed: 6127,
+    // The floor is one river, wall to wall. Streams and tarns on the rims spill over the cliffs.
+    relief: 1500, ridge: 0.52, featureScale: 4400, gully: 0.62,
+    valleyWidth: 1600, floodplain: 560, river: 18, floor: 4.2,
+    path: [560, 220, 70], pathLen: [16000, 7000, 3100], meander: 45, meanderLen: 1800,
+    density: 0.7, spacing: 8.5, height: 30, conifer: 0.38,
+    autumn: 0.0, treeline: 640, snowline: 1280, clearings: 0.28,
+    rock: 1.0, wetland: 0.05, basin: 0.0, tropical: 0,
+    mist: 0.14, mistTop: 28,
+    water: 420, waterSlope: 0.004, tannin: 0.12,
+    falls: 0.92, fallCliff: 180, fallSpacing: 340, fallWidth: 1.05,
+    flight: { agl: 340, speed: 52, pitch: -20, fov: 56 },
+    sky: { sunElev: 30, sunAzim: 108, haze: 1.1, clouds: 0.34, cloudAltitude: 2.6, veil: 0.16 },
+  },
 ];
 
 export function sceneById(id) {
@@ -158,7 +176,7 @@ function hash01(n) {
   return (x >>> 0) / 4294967296;
 }
 
-// f: Float32Array of the Frame, written at offsets 100..139. visit varies the terrain
+// f: Float32Array of the Frame, written at offsets 100..143. visit varies the terrain
 // seed so each pass through the tour is a new stretch of country. mul scales the forest
 // (density, height) from the settings panel.
 export function sceneUniforms(f, scene, visit, mul) {
@@ -177,6 +195,7 @@ export function sceneUniforms(f, scene, visit, mul) {
   f[128] = scene.rock; f[129] = scene.wetland; f[130] = scene.basin; f[131] = scene.tropical;
   f[132] = scene.mist * mul.mist; f[133] = scene.mistTop; f[134] = scene.canyon ? 1 : 0; f[135] = seed;
   f[136] = scene.water; f[137] = scene.waterSlope; f[138] = scene.tannin; f[139] = scene.coast ? 1 : 0;
+  f[140] = scene.falls || 0; f[141] = scene.fallCliff || 140; f[142] = scene.fallSpacing || 320; f[143] = scene.fallWidth || 1;
 
   const A = scene.path, M = scene.meander;
   const valleyX = (z) => A[0] * Math.sin(k[0] * z + ph[0]) + A[1] * Math.sin(k[1] * z + ph[1]) + A[2] * Math.sin(k[2] * z + ph[2]);

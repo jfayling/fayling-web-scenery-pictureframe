@@ -220,7 +220,7 @@ async function main() {
     magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear',
     addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge', addressModeW: 'clamp-to-edge',
   });
-  const frameUBO = mkBuf(560, GU.UNIFORM | GU.COPY_DST, 'frame ubo');
+  const frameUBO = mkBuf(576, GU.UNIFORM | GU.COPY_DST, 'frame ubo');
   const transView = transLUT.createView();
   const msView = msLUT.createView();
   const skyView = skyLUT.createView();
@@ -638,7 +638,7 @@ async function main() {
   // --------------------------------------------------------------------------------------
   // Uniform data
   // --------------------------------------------------------------------------------------
-  const frameF = new Float32Array(140);
+  const frameF = new Float32Array(144);
   const frameI = new Int32Array(frameF.buffer);
   const atmoF = new Float32Array(4);
   const proj = new Float32Array(16), view = new Float32Array(16), viewProj = new Float32Array(16);
@@ -777,6 +777,12 @@ async function main() {
       // the tightest pinch, so the aircraft does not climb out onto the rim.
       const weave = Math.sin(z * (Math.PI * 2 / 16000) + path.seed * 0.17);
       return path.valleyX(z) + weave * 70;
+    }
+    if (s.falls) {
+      // Clearance probes reach 300 m to either side. A wide sway would plant
+      // them on the cliffs and the aircraft would climb out of the valley.
+      const sway = Math.min(s.floodplain * 0.18, 100) * Math.sin(phase);
+      return path.valleyX(z) + sway;
     }
     // a slow sway across the valley keeps one wall, then the other, in the picture
     const sway = (s.floodplain + s.valleyWidth * 0.25) * 0.35 * Math.sin(phase);
@@ -1420,7 +1426,7 @@ async function main() {
       f[92] = Math.sin(rotation); f[93] = 0; f[94] = -Math.cos(rotation); f[95] = 0;
     }
     frameI[96] = lowIx; frameI[97] = lowIz; frameI[98] = highIx; frameI[99] = highIz;
-    // 100..139: the scene (scenes.js)
+    // 100..143: the scene (scenes.js)
     device.queue.writeBuffer(frameUBO, 0, f);
   }
 
