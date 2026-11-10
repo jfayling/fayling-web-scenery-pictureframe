@@ -270,6 +270,11 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
   let glow = vec3f(0.002, 0.003, 0.005) * F.nightP.w;
   lt.zen = lt.zen * skyDim * sunScale + glow;
   lt.hor = lt.hor * skyDim * sunScale + glow;
+  let nl = nightLandscape();
+  lt.zen += nl.zen;
+  lt.hor += nl.hor;
+  lt.moon += nl.key;
+  if (nl.on > 0.5) { lt.M = nl.dir; }
 
   var col = vec3f(0.0);
   if (depth > 0.0) {

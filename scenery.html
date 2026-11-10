@@ -623,6 +623,44 @@ fn skyMapUV(dir: vec3f) -> vec2f {
   let el = asin(clamp(d.y, 0.0, 1.0));
   return vec2f(az * (0.5 / PI) + 0.5, el * (2.0 / PI));
 }
+
+// Picture-frame night light for the ground and the trees. The real moon is hundreds of
+// times dimmer than the sun term, so a sun-down landscape tone-maps to black. This adds
+// a cool fill and a soft key so ridges, forest, and the shore stay readable, and it is
+// gone before the sun reaches the horizon so daylight is unchanged. The sky stays dark.
+struct NightLand {
+  zen: vec3f,
+  hor: vec3f,
+  key: vec3f,
+  dir: vec3f,
+  on: f32,
+};
+fn nightLandscape() -> NightLand {
+  var o: NightLand;
+  o.zen = vec3f(0.0);
+  o.hor = vec3f(0.0);
+  o.key = vec3f(0.0);
+  o.dir = vec3f(0.0, 1.0, 0.0);
+  o.on = 0.0;
+  let night = 1.0 - smoothstep(-0.20, -0.02, F.sunDir.y);
+  if (night < 0.001) { return o; }
+  // Night-sky brightness still scales the lift. The floor keeps a dim dynamic night visible.
+  let amt = night * (0.78 + 0.22 * clamp(F.nightP.w, 0.0, 2.5));
+  o.zen = vec3f(0.16, 0.19, 0.28) * amt;
+  o.hor = vec3f(0.10, 0.12, 0.16) * amt;
+  let moonLen = length(F.moonDir.xyz);
+  let moon = select(vec3f(0.42, 0.15, 0.89), F.moonDir.xyz / max(moonLen, 1e-4), moonLen > 1e-4);
+  let moonUp = smoothstep(0.0, 0.16, moon.y);
+  var phase = 0.62;
+  if (length(F.moonLight.xyz) > 1e-4) {
+    let lite = normalize(F.moonLight.xyz);
+    phase = mix(0.45, 1.0, clamp(0.5 * (1.0 + dot(lite, -moon)), 0.0, 1.0));
+  }
+  o.key = vec3f(0.42, 0.46, 0.58) * phase * mix(0.62, 1.0, moonUp) * amt;
+  o.dir = normalize(vec3f(moon.x, mix(0.38, moon.y, moonUp), moon.z));
+  o.on = 1.0;
+  return o;
+}
 `;
 
 // Clouds + full sky radiance (needs the same bindings as SKY_RENDER_FUNCS).
@@ -2532,6 +2570,11 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
   let glow = vec3f(0.002, 0.003, 0.005) * F.nightP.w;
   lt.zen = lt.zen * skyDim * sunScale + glow;
   lt.hor = lt.hor * skyDim * sunScale + glow;
+  let nl = nightLandscape();
+  lt.zen += nl.zen;
+  lt.hor += nl.hor;
+  lt.moon += nl.key;
+  if (nl.on > 0.5) { lt.M = nl.dir; }
 
   var col = vec3f(0.0);
   if (depth > 0.0) {
@@ -2807,12 +2850,15 @@ fn main() {
   let glow = vec3f(0.002, 0.003, 0.005) * F.nightP.w;
   zen = zen * skyDim * sunScale + glow;
   hor = hor * skyDim * sunScale + glow;
+  let nl = nightLandscape();
+  zen += nl.zen;
+  hor += nl.hor;
   outL[0] = vec4f(sun, 0.0);
-  outL[1] = vec4f(moonIlluminance(), 0.0);
+  outL[1] = vec4f(moonIlluminance() + nl.key, 0.0);
   outL[2] = vec4f(zen, 0.0);
   outL[3] = vec4f(hor, 0.0);
   outL[4] = vec4f(L, 0.0);
-  outL[5] = vec4f(normalize(F.moonDir.xyz), 0.0);
+  outL[5] = vec4f(select(normalize(F.moonDir.xyz), nl.dir, nl.on > 0.5), 0.0);
 }
 `;
 }

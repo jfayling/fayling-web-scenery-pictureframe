@@ -90,12 +90,15 @@ fn main() {
   let glow = vec3f(0.002, 0.003, 0.005) * F.nightP.w;
   zen = zen * skyDim * sunScale + glow;
   hor = hor * skyDim * sunScale + glow;
+  let nl = nightLandscape();
+  zen += nl.zen;
+  hor += nl.hor;
   outL[0] = vec4f(sun, 0.0);
-  outL[1] = vec4f(moonIlluminance(), 0.0);
+  outL[1] = vec4f(moonIlluminance() + nl.key, 0.0);
   outL[2] = vec4f(zen, 0.0);
   outL[3] = vec4f(hor, 0.0);
   outL[4] = vec4f(L, 0.0);
-  outL[5] = vec4f(normalize(F.moonDir.xyz), 0.0);
+  outL[5] = vec4f(select(normalize(F.moonDir.xyz), nl.dir, nl.on > 0.5), 0.0);
 }
 `;
 }
