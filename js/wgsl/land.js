@@ -88,8 +88,15 @@ struct VSOut {
   let h = clipHeight(xz, lv);
   let wl = waterLevel(xz.y);
   var y = max(h, wl);
+  var shift = vec2f(0.0);
+  if (F.water.w > 0.5 && h < wl) {
+    let sea = seaState(xz, F.camPos.w, eff * 3.6, wl - h, false);
+    let wet = smoothstep(0.2, 2.6, wl - h);
+    y = mix(max(h, wl), wl + sea.height, wet);
+    shift = sea.chop * wet;
+  }
   var o: VSOut;
-  var rel = vec3f(xz.x, y, xz.y) - F.camPos.xyz;
+  var rel = vec3f(xz.x + shift.x, y, xz.y + shift.y) - F.camPos.xyz;
   rel.y -= dot(rel.xz, rel.xz) / (2.0 * EARTH_R);
   o.rel = rel;
   o.pos = F.viewProj * vec4f(rel, 1.0);
@@ -266,28 +273,42 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
 
   var col = vec3f(0.0);
   if (depth > 0.0) {
-    // ---- water: lakes and the river ----
-    var flow = vec2f(0.0);
-    if (F.valley.z > 0.0) {
-      let rw = riverHalfWidth(xz.y);
-      let inRiver = 1.0 - smoothstep(1.1, 2.0, abs(riverOffset(xz)) / rw);
-      flow = normalize(vec2f(riverDX(xz.y), 1.0)) * 0.9 * inRiver;
-    }
+    // ---- water: lakes, the river, and the Pacific swell ----
     let t = F.camPos.w;
     let detail = 1.0 - smoothstep(0.6, 6.0, fp);
     let ocean = F.water.w > 0.5;
-    let k1 = select(1.0 / 7.0, 1.0 / 48.0, ocean);
-    let k2 = select(1.0 / 2.3, 1.0 / 13.0, ocean);
-    let r1 = gnoised(xz * k1 - flow * t * k1 + vec2f(0.0, t * select(0.02, 0.006, ocean)));
-    let r2 = gnoised(xz * k2 - flow * t * select(1.3, 0.55, ocean) * k2 + vec2f(t * select(0.05, 0.015, ocean), 0.0));
-    var sl = r1.yz * select(0.021, 0.06, ocean) + r2.yz * select(0.018, 0.026, ocean) * detail;
+    var sl = vec2f(0.0);
+    var crest = 0.0;
+    var waveH = 0.0;
     if (ocean) {
-      let swell = gnoised(vec2f(xz.x * 0.0036 + t * 0.01, xz.y * 0.0024 + t * 0.003));
-      sl += swell.yz * 0.1;
+      let sea = seaState(xz, t, max(fp * 1.4, 2.0), depth, true);
+      sl = sea.slope;
+      crest = sea.crest;
+      waveH = sea.height;
+      // capillary glitter on top of the resolved swell, blown onshore
+      if (fp < 16.0) {
+        let wind = normalize(vec2f(0.97, 0.24));
+        let rip = gnoised(xz * (1.0 / 3.4) - wind * t * 0.7);
+        let rip2 = gnoised(xz * (1.0 / 1.2) - wind * t * 1.35 + vec2f(2.2, 5.4));
+        let det = 1.0 - smoothstep(2.5, 16.0, fp);
+        sl += (rip.yz * 0.04 + rip2.yz * 0.02) * det;
+      }
+    } else {
+      var flow = vec2f(0.0);
+      if (F.valley.z > 0.0) {
+        let rw = riverHalfWidth(xz.y);
+        let inRiver = 1.0 - smoothstep(1.1, 2.0, abs(riverOffset(xz)) / rw);
+        flow = normalize(vec2f(riverDX(xz.y), 1.0)) * 0.9 * inRiver;
+      }
+      let r1 = gnoised(xz * (1.0 / 7.0) - flow * t * (1.0 / 7.0) + vec2f(0.0, t * 0.02));
+      let r2 = gnoised(xz * (1.0 / 2.3) - flow * t * 1.3 * (1.0 / 2.3) + vec2f(t * 0.05, 0.0));
+      sl = r1.yz * 0.021 + r2.yz * 0.018 * detail;
     }
     let n = normalize(vec3f(-sl.x, 1.0, -sl.y));
-    // unresolved ripples widen the sun glint with distance
-    let rough = 0.05 + 0.10 * smoothstep(0.5, 30.0, fp) + wet * 0.14;
+    // unresolved ripples widen the sun glint with distance. The swell is a few long
+    // trains, so the ocean's glitter is a little broader than a river's or it locks
+    // into hard dashes on every crest.
+    let rough = select(0.05, 0.1, ocean) + 0.12 * smoothstep(0.5, 30.0, fp) + wet * 0.14;
     let NdV = max(dot(n, V), 1e-3);
     let Fr = schlick(NdV, 0.02);
     var R = reflect(-V, n);
@@ -317,12 +338,12 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
     let spark = pow(max(sin(ripple.x * 1.7) * sin(ripple.y * 1.3), 0.0), 12.0);
     glint += lt.sun * sunVis * spark * wet * 0.22;
     col = body * (1.0 - Fr) + refl * Fr + glint;
-    if (ocean) {
-      // a broken line of surf on the waterline, not across the whole shelf
-      let band = 1.0 - smoothstep(0.12, 0.85, depth);
-      let wash = smoothstep(0.05, 0.55, snoise(vec2f(xz.x * 0.08, xz.y * 0.02 - t * 0.4)));
-      let foam = vec3f(0.72, 0.78, 0.8) * (lt.hor * 0.9 + lt.sun * sunVis * 0.1);
-      col = mix(col, foam, band * wash * 0.55);
+    if (ocean) { col *= 1.0 + clamp(waveH * 0.14, -0.12, 0.16); }
+    if (ocean && crest > 0.02) {
+      let lace = smoothstep(0.22, 0.72, snoise(xz * vec2f(0.08, 0.035) + vec2f(t * 0.15, 0.6)));
+      let mask = clamp(crest * mix(0.55, 1.0, lace), 0.0, 1.0);
+      let foam = vec3f(0.76, 0.82, 0.86) * (lt.hor * 0.7 + lt.zen * 0.35 + lt.sun * sunVis * 0.25);
+      col = mix(col, foam, mask * 0.92);
     }
   } else {
     // ---- land ----

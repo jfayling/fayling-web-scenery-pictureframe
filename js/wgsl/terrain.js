@@ -319,6 +319,74 @@ fn terrainHeight(xz: vec2f, texel: f32) -> f32 {
   }
   return h;
 }
+
+// Pacific swell for the coast scene. Wavelengths and phase speed follow the ocean
+// frame: a narrow groundswell near 120 m plus a wind sea, each traveling at sqrt(g/k)
+// with chop on the crests. Heights sit toward the heavy end of that frame's swell so
+// the sets still read from a few hundred metres up. dir points onshore (+x).
+// minL drops trains the grid or the pixel cannot resolve. depth is metres of water.
+struct Sea {
+  height: f32,
+  chop: vec2f,
+  slope: vec2f,
+  crest: f32,
+  jac: vec3f,
+};
+
+fn seaContrib(xz: vec2f, t: f32, dir: vec2f, length: f32, amp: f32, steep: f32, phase0: f32, minL: f32, depth: f32, sea: ptr<function, Sea>) {
+  let keep = smoothstep(max(minL, 0.25) * 1.35, max(minL, 0.25) * 3.4, length);
+  if (keep < 0.001) { return; }
+  let k = 6.28318530718 / length;
+  let phase = k * dot(dir, xz) - sqrt(9.81 * k) * t + phase0;
+  let s = sin(phase);
+  let c = cos(phase);
+  let d = max(depth, 0.25);
+  // the swell feels the bottom inside half a wavelength, stands up, then dumps
+  let feel = 1.0 - smoothstep(length * 0.05, length * 0.32, d);
+  let grow = mix(1.0, 1.65, feel);
+  let Hb = amp * grow;
+  let breakK = smoothstep(max(Hb * 2.6, 1.8), max(Hb * 0.7, 0.45), d);
+  let a = Hb * (1.0 - breakK * 0.82) * keep;
+  (*sea).height += a * s;
+  (*sea).slope += dir * (k * a * c);
+  (*sea).chop += dir * (steep * a * c);
+  let qk = steep * k * a;
+  (*sea).jac -= vec3f(qk * dir.x * dir.x, qk * dir.y * dir.y, qk * dir.x * dir.y) * s;
+  let face = pow(max(sin(phase - 0.35), 0.0), 5.0);
+  (*sea).crest += breakK * face * keep;
+}
+
+fn seaState(xz: vec2f, t: f32, minL: f32, depth: f32, foam: bool) -> Sea {
+  var sea: Sea;
+  // Groundswell near the ocean frame's 120 m peak, plus a crossing set and a wind sea.
+  // Wavelengths are not octaves, so the crests do not lock into a repeating lattice.
+  seaContrib(xz, t, normalize(vec2f(0.985, 0.17)), 137.0, 1.05, 0.85, 0.40, minL, depth, &sea);
+  seaContrib(xz, t, normalize(vec2f(0.93, 0.37)), 103.0, 0.48, 0.95, 1.20, minL, depth, &sea);
+  seaContrib(xz, t, normalize(vec2f(0.96, -0.28)), 79.0, 0.32, 1.0, 2.50, minL, depth, &sea);
+  seaContrib(xz, t, normalize(vec2f(0.62, 0.78)), 168.0, 0.36, 0.70, 0.90, minL, depth, &sea);
+  seaContrib(xz, t, normalize(vec2f(0.88, 0.47)), 54.0, 0.16, 1.1, 1.80, minL, depth, &sea);
+  seaContrib(xz, t, normalize(vec2f(0.99, 0.08)), 33.0, 0.08, 1.15, 2.20, minL, depth, &sea);
+  seaContrib(xz, t, normalize(vec2f(0.75, -0.66)), 19.0, 0.035, 1.15, 0.30, minL, depth, &sea);
+  if (foam) {
+    let broken = sea.crest;
+    let jxx = 1.0 + sea.jac.x;
+    let jzz = 1.0 + sea.jac.y;
+    let J = jxx * jzz - sea.jac.z * sea.jac.z;
+    // whitecaps only where several crests stack and a gust is overhead
+    let pinch = clamp((0.90 - J) * 8.0, 0.0, 1.0);
+    let gust = smoothstep(0.58, 0.84, snoise(xz * 0.0018 + vec2f(t * 0.003, 2.2)) * 0.5 + 0.5);
+    sea.crest = max(broken, pinch * pinch * gust);
+    // surf stays in the last few metres of water and travels with the groundswell
+    let dir0 = normalize(vec2f(0.985, 0.17));
+    let k0 = 6.28318530718 / 137.0;
+    let face0 = pow(max(sin(k0 * dot(dir0, xz) - sqrt(9.81 * k0) * t), 0.0), 3.0);
+    let along = snoise(vec2f(dot(xz, vec2f(-dir0.y, dir0.x)) * 0.008, 4.2));
+    let wash = smoothstep(3.4, 0.35, depth) * smoothstep(0.15, 0.7, along * 0.5 + 0.5);
+    sea.crest = max(sea.crest, wash * (0.3 + 0.7 * face0));
+  }
+  sea.crest = clamp(sea.crest, 0.0, 1.0);
+  return sea;
+}
 `;
 
 // One clipmap level, height only. B.xy is the world position of texel (0, 0).
