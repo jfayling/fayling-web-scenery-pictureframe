@@ -772,6 +772,12 @@ async function main() {
       const sway = 170 * Math.sin(z * (Math.PI * 2 / 15000) + path.seed * 0.37);
       return path.valleyX(z) - (s.flight.offshore ?? 360) + sway;
     }
+    if (s.canyon) {
+      // Stay low in the gorge and trade sides slowly. The weave is narrower than
+      // the tightest pinch, so the aircraft does not climb out onto the rim.
+      const weave = Math.sin(z * (Math.PI * 2 / 16000) + path.seed * 0.17);
+      return path.valleyX(z) + weave * 70;
+    }
     // a slow sway across the valley keeps one wall, then the other, in the picture
     const sway = (s.floodplain + s.valleyWidth * 0.25) * 0.35 * Math.sin(phase);
     return path.valleyX(z) + sway;

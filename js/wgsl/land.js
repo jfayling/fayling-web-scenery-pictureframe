@@ -174,8 +174,43 @@ fn direct(lt: Light, n: vec3f, sunVis: f32) -> vec3f {
   return lt.sun * sunVis * max(dot(n, lt.L), 0.0) + lt.moon * max(dot(n, lt.M), 0.0);
 }
 
+// Colorado Plateau sequence, as a fraction of the drop from rim to river.
+fn canyonStone(u: f32) -> vec3f {
+  var c = vec3f(0.045, 0.042, 0.040);
+  c = mix(c, vec3f(0.18, 0.11, 0.06), smoothstep(0.16, 0.26, u));
+  c = mix(c, vec3f(0.22, 0.16, 0.09), smoothstep(0.28, 0.34, u));
+  c = mix(c, vec3f(0.48, 0.14, 0.045), smoothstep(0.34, 0.46, u));
+  c = mix(c, vec3f(0.36, 0.12, 0.04), smoothstep(0.58, 0.68, u));
+  c = mix(c, vec3f(0.52, 0.40, 0.26), smoothstep(0.82, 0.92, u));
+  c = mix(c, vec3f(0.42, 0.35, 0.26), smoothstep(0.94, 1.02, u));
+  return c;
+}
+fn canyonAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, curv: f32) -> vec3f {
+  let u = clamp(above / max(F.relief.x, 1.0), 0.0, 1.15);
+  var stone = canyonStone(u);
+  // Patches of lighter and darker rock, and a few varnish streaks. The strata
+  // stay in broad bands; the streaks are what keep a face from being one colour.
+  let face = snoise(xz * (1.0 / 340.0) + vec2f(u * 3.0, 1.4));
+  stone *= 0.8 + 0.28 * (0.5 + 0.5 * face);
+  let streak = snoise(vec2f(xz.y * 0.007, above * 0.0007));
+  stone *= 1.0 - pow(saturate(streak), 4.0) * 0.24;
+  let bed = sin(above * 0.022 + snoise(vec2f(xz.y * 0.0006, 2.2)) * 1.2);
+  stone *= 0.92 + 0.1 * (0.5 + 0.5 * bed);
+  if (fp < 14.0) {
+    let fine = sin(above * 0.15 + snoise(xz * 0.0035) * 1.3);
+    stone *= 0.88 + 0.18 * (0.5 + 0.5 * fine);
+  }
+  stone *= clamp(1.0 + curv * 5.0, 0.58, 1.28);
+  var soil = mix(vec3f(0.20, 0.13, 0.06), vec3f(0.11, 0.125, 0.05), smoothstep(-0.2, 0.55, face));
+  soil = mix(soil, stone, 0.38);
+  var c = mix(soil, stone, clamp(rock, 0.0, 1.0));
+  c = mix(c, c * vec3f(0.72, 0.8, 0.58), smoothstep(0.18, 0.65, dens) * 0.4);
+  return c;
+}
+
 // Ground cover between and outside the trees.
 fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32, curv: f32) -> vec3f {
+  if (F.mist.z > 0.5) { return canyonAlbedo(xz, fp, above, dens, rock, curv); }
   let n1 = fbm2(xz * (1.0 / 45.0) + vec2f(2.0, 9.0), select(2, 1, fp > 6.0));
   let n2 = snoise(xz * (1.0 / 9.0) + vec2f(5.0, 1.0)) * (1.0 - smoothstep(2.0, 9.0, fp));
   let dry = F.forest2.x * 0.6 + smoothstep(-0.2, 0.4, n1) * 0.22;
@@ -315,13 +350,16 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
     // into hard dashes on every crest.
     let rough = select(0.05, 0.1, ocean) + 0.12 * smoothstep(0.5, 30.0, fp) + wet * 0.14;
     let NdV = max(dot(n, V), 1e-3);
-    let Fr = schlick(NdV, 0.02);
+    var Fr = schlick(NdV, 0.02);
     var R = reflect(-V, n);
     R.y = abs(R.y);
     var refl = textureSampleLevel(reflTex, sampR, skyMapUV(R), 0.0).rgb;
     // the wooded banks darken the reflection near the shore
     let bankK = (1.0 - smoothstep(0.2, 3.5, depth)) * smoothstep(0.0, 0.4, 1.0 - R.y);
-    let bankCol = standAlbedo(0.5) * (lt.sun * sunVis * 0.25 + ambient(lt, Nt)) * (0.9 / PI);
+    var bankCol = standAlbedo(0.5) * (lt.sun * sunVis * 0.25 + ambient(lt, Nt)) * (0.9 / PI);
+    if (F.mist.z > 0.5) {
+      bankCol = vec3f(0.16, 0.065, 0.03) * (lt.sun * sunVis * 0.35 + ambient(lt, Nt)) * (0.9 / PI);
+    }
     refl = mix(refl, bankCol, bankK * select(0.75, 0.12, ocean));
     let Hs = normalize(V + lt.L);
     let NdL = max(dot(n, lt.L), 0.0);
@@ -330,6 +368,13 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
     var deep = mix(vec3f(0.006, 0.016, 0.016), vec3f(0.016, 0.010, 0.004), tannin);
     var bed = groundAlbedo(xz, fp, 0.5, 0.0, 0.0, 0.0, 0.0) * mix(vec3f(0.7, 0.85, 0.8), vec3f(0.8, 0.6, 0.35), tannin);
     var extK = mix(vec3f(0.45, 0.16, 0.12), vec3f(0.35, 0.55, 0.9), tannin);
+    if (F.mist.z > 0.5) {
+      // silt: opaque red-brown, and dull enough that a glancing view does not turn into sky
+      deep = vec3f(0.12, 0.048, 0.018);
+      bed = vec3f(0.20, 0.09, 0.035);
+      extK = vec3f(2.4, 3.6, 4.8);
+      Fr = min(Fr, 0.07);
+    }
     if (ocean) {
       deep = vec3f(0.004, 0.026, 0.052);
       let sandCol = vec3f(0.52, 0.44, 0.30) * (0.86 + 0.22 * snoise(xz * 0.03));

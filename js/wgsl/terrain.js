@@ -1,5 +1,5 @@
 // Procedural landscape: eroded mountains, a meandering river valley, a one-sided coastline,
-// lake basins, and the vegetation / rock / snow masks that go with them. The height function is baked into
+// a plateau canyon, lake basins, and the vegetation / rock / snow masks that go with them. The height function is baked into
 // camera-centred clipmaps (one 512² layer per level, texel doubling per level) and the
 // renderer samples those instead of re-evaluating the noise per pixel.
 import { FRAME_WGSL, NOISE_WGSL, CLIP_RES, CLIP_LEVELS, CLIP_TEXEL0, PROBE_N } from './common.js';
@@ -324,11 +324,148 @@ fn coastHeight(xz: vec2f, texel: f32, m: f32, wl: f32) -> f32 {
   return wl + hLand + micro * mix(0.15, 1.0, rise);
 }
 
+// A cliff band as a few ledges. warp slides the risers along the canyon without
+// moving the top or the foot, so neighbouring stretches don't share the same steps.
+fn cliffSteps(t: f32, steps: f32, warp: f32) -> f32 {
+  let x = clamp(t + warp * sin(t * 3.14159265), 0.0, 1.0);
+  let s = x * steps;
+  let i = floor(s);
+  let f = s - i;
+  return clamp((i + smoothstep(0.0, 0.06, f)) / steps, 0.0, 1.0);
+}
+
+// Stepped cross-section, in metres from the river. x is the height fraction (0 at the
+// river, 1 on the rim). yzw are the gorge lip, the last cliff, and the rim, in metres.
+// Each cliff is several ledges. Only the benches widen as the canyon opens.
+fn canyonCross(ad: f32, open: f32, k: f32) -> vec4f {
+  let floorW = 150.0 * k;
+  let g1 = floorW + mix(140.0, 240.0, open) * k;
+  let b1 = g1 + mix(40.0, 220.0, open) * k;
+  let r1 = b1 + mix(70.0, 130.0, open) * k;
+  let b2 = r1 + mix(30.0, 120.0, open) * k;
+  let s1 = b2 + mix(60.0, 120.0, open) * k;
+  let c1 = s1 + mix(70.0, 130.0, open) * k;
+  // Beds stay level. The wall's variation is in plan: buttresses, alcoves, ravines.
+  let gT = clamp((ad - floorW) / max(g1 - floorW, 1.0), 0.0, 1.0);
+  var h = mix(0.02, 0.26, cliffSteps(gT, 2.0, 0.0));
+  let t1 = clamp((ad - g1) / max(b1 - g1, 1.0), 0.0, 1.0);
+  h = mix(h, mix(0.26, 0.32, t1), step(g1, ad));
+  let rT = clamp((ad - b1) / max(r1 - b1, 1.0), 0.0, 1.0);
+  h = mix(h, mix(0.32, 0.60, cliffSteps(rT, 1.0, 0.0)), step(b1, ad));
+  let t2 = clamp((ad - r1) / max(b2 - r1, 1.0), 0.0, 1.0);
+  h = mix(h, mix(0.60, 0.66, t2), step(r1, ad));
+  let sT = clamp((ad - b2) / max(s1 - b2, 1.0), 0.0, 1.0);
+  h = mix(h, mix(0.66, 0.86, cliffSteps(sT, 2.0, 0.0)), step(b2, ad));
+  let cT = clamp((ad - s1) / max(c1 - s1, 1.0), 0.0, 1.0);
+  h = mix(h, mix(0.86, 1.0, cliffSteps(cT, 1.0, 0.0)), step(s1, ad));
+  return vec4f(h, g1, s1, c1);
+}
+
+// Broad recesses along the wall. Narrow slots read as drips, so these stay wide
+// and only occur where the noise peaks.
+fn wallGroove(z: f32, side: f32) -> f32 {
+  let n = snoise(vec2f(z * 0.00055, side * 3.2));
+  return pow(saturate(n), 2.0) * 0.18;
+}
+
+// Tributaries of the main gorge. Returns the lowered height fraction.
+fn canyonTributary(across: f32, z: f32, reach0: f32, mainFrac: f32) -> f32 {
+  let spacing = max(F.relief.z * 0.62, 3200.0);
+  let cell = floor(z / spacing);
+  var frac = mainFrac;
+  for (var i = -1; i <= 1; i++) {
+    let cz = cell + f32(i);
+    let h = seedHash2(vec2i(i32(cz), 23));
+    if (h.x > 0.4) {
+      let mouthZ = (cz + 0.16 + 0.68 * h.y) * spacing;
+      let side = select(-1.0, 1.0, h.x > 0.7);
+      let along = side * across;
+      let width = mix(220.0, 780.0, h.y);
+      let reach = reach0 * mix(1.4, 2.8, fract(h.x * 7.1));
+      let bend = sin(along * 0.00035 + h.y * 5.2) * width * 0.7;
+      let flank = abs(z - mouthZ - bend);
+      let w = width * mix(1.35, 0.32, smoothstep(0.0, reach, along));
+      let slot = (1.0 - smoothstep(w * 0.18, w, flank))
+               * smoothstep(-120.0, 260.0, along)
+               * (1.0 - smoothstep(reach * 0.72, reach, along));
+      let floorU = mix(0.06, 0.58, clamp(along / max(reach, 1.0), 0.0, 1.0));
+      frac = min(frac, mix(mainFrac, floorU, slot));
+    }
+  }
+  return frac;
+}
+
+// Flat-topped temples. inner/outer are metres from the river; outside that band
+// the plateau is already at rim height, so a tower would not show.
+fn canyonButte(xz: vec2f, ad: f32, inner: f32, outer: f32) -> f32 {
+  if (ad < inner || ad > outer) { return 0.0; }
+  let zone = snoise(vec2f(xz.y * 0.000055, 6.8));
+  if (zone < 0.0) { return 0.0; }
+  let n = snoise(xz * (1.0 / 1250.0) + vec2f(2.4, 8.1));
+  if (n < 0.4) { return 0.0; }
+  let d = 0.55 - n;
+  let tower = 1.0 - smoothstep(0.0, 0.08, d);
+  let n2 = snoise(xz * (1.0 / 480.0) + vec2f(5.5, 1.2));
+  let spire = (1.0 - smoothstep(0.0, 0.07, 0.58 - n2)) * 0.58;
+  return max(tower, spire);
+}
+
+// A gorge cut through a high plateau: flat rims, stepped walls, side canyons and buttes.
+// F.relief.x is the depth from rim to river. F.valley.x scales the width (3200 is the
+// tuned Grand Canyon).
+fn canyonHeight(xz: vec2f, texel: f32, wl: f32) -> f32 {
+  let z = xz.y;
+  let s = valleyDX(z);
+  let across = (xz.x - valleyX(z)) * inverseSqrt(1.0 + s * s);
+  let open = smoothstep(-0.15, 0.45, snoise(vec2f(z * 0.00008, 2.6)));
+  let k = clamp(F.valley.x / 3200.0, 0.45, 2.2);
+  // The river keeps the bottom of the gorge. Farther up, one wall steps inward,
+  // and each wall scallops into buttresses and alcoves of its own.
+  let hug = snoise(vec2f(z * 0.00012, 4.4)) * mix(30.0, 140.0, open) * k;
+  let axis = hug * smoothstep(280.0, 900.0, abs(across));
+  let side = select(-1.0, 1.0, across >= 0.0);
+  let wallK = smoothstep(100.0, 380.0, abs(across));
+  let outer = smoothstep(420.0, 1100.0, abs(across));
+  let scallop = snoise(vec2f(z * 0.00032, side * 4.2)) * 90.0
+              + snoise(vec2f(z * 0.00105, side * 2.2 + 3.0)) * 34.0;
+  let bowl = snoise(vec2f(z * 0.00015, side * 1.6)) * 180.0 * outer;
+  let ad = max(abs(across - axis) - (scallop * wallK + bowl) * k, 0.0);
+  let cross = canyonCross(ad, open, k);
+  var frac = cross.x;
+  frac = canyonTributary(across, z, cross.w, frac);
+  let butte = canyonButte(xz, ad, cross.y + 40.0, cross.z);
+  frac = clamp(max(frac, butte), 0.0, 1.0);
+  // Chutes down the faces, with a debris fan where they meet a bench.
+  let groove = wallGroove(z, side) * F.relief.w;
+  let cliffy = smoothstep(0.16, 0.4, frac) * (1.0 - smoothstep(0.9, 1.01, frac));
+  let cut = groove * cliffy;
+  let bench = smoothstep(0.18, 0.28, frac) * (1.0 - smoothstep(0.34, 0.52, frac));
+  frac = clamp(frac - cut + pow(max(groove, 0.0), 0.55) * bench * 0.045, 0.0, 1.0);
+  // One rim sits a little higher than the other, like the north and south rims.
+  let depth = F.relief.x * (1.0 + select(-0.045, 0.06, across > 0.0) * smoothstep(0.55, 0.95, frac));
+  let scale = max(F.relief.z, 400.0);
+  let roll = snoise(xz / scale) * 48.0 + snoise(xz / (scale * 0.36) + vec2f(4.0, 2.0)) * 18.0;
+  var h = wl + depth * frac + roll * smoothstep(0.82, 1.0, frac);
+  if (texel < 20.0) {
+    let rough = smoothstep(0.2, 0.45, frac) * (1.0 - smoothstep(0.9, 1.01, frac));
+    h += snoise(vec2f(z * 0.02, frac * 8.0 + side)) * 4.0 * rough;
+  }
+  if (F.valley.z > 0.0) {
+    let rw = riverHalfWidth(z);
+    let ar = abs(riverOffset(xz));
+    let x = ar / rw;
+    let bed = wl - 1.4 - 4.2 * max(1.0 - x * x, 0.0);
+    h = mix(min(h, bed), h, smoothstep(0.72, 1.15, x));
+  }
+  return h;
+}
+
 // Terrain height in metres.
 fn terrainHeight(xz: vec2f, texel: f32) -> f32 {
-  let m = mountainField(xz, texel);
   let z = xz.y;
   let wl = waterLevel(z);
+  if (F.mist.z > 0.5) { return canyonHeight(xz, texel, wl); }
+  let m = mountainField(xz, texel);
   if (F.water.w > 0.5) { return coastHeight(xz, texel, m, wl); }
   var shape = 1.0;
   if (F.valley.x > 0.0) {
@@ -531,6 +668,21 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   var snow = smoothstep(F.forest2.z - 40.0, F.forest2.z + 90.0, above + snowN * 140.0 + lap * 400.0);
   // snow slides off steep faces, leaving dark rock ribs between the snowfields
   snow *= 1.0 - smoothstep(0.55, 0.95, slope + snowN * 0.25);
+
+  if (F.mist.z > 0.5) {
+    // Pinyon and juniper on the rims, a thinner scatter on the benches, bare walls.
+    let D = max(F.relief.x, 1.0);
+    let u = above / D;
+    let rim = smoothstep(0.84, 0.97, u);
+    let bench = smoothstep(0.22, 0.32, u) * (1.0 - smoothstep(0.42, 0.55, u));
+    let flat = 1.0 - smoothstep(0.45, 1.05, slope);
+    dens = F.forest.x * regrow * flat * max(rim, bench * 0.4);
+    let cliff = smoothstep(0.4, 1.05, slope);
+    rock = max(cliff, (1.0 - rim) * 0.94);
+    rock = mix(rock, 0.32, rim * (1.0 - cliff));
+    rock = clamp(rock * F.biome.x, 0.0, 1.0);
+    snow = 0.0;
+  }
 
   textureStore(dstA, id.xy, u32(B.level), vec4f(h, grad, lap));
   textureStore(dstB, id.xy, u32(B.level), vec4f(clamp(dens, 0.0, 1.0), conif, clamp(rock, 0.0, 1.0), clamp(snow, 0.0, 1.0)));

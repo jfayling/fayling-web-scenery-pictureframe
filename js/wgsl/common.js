@@ -48,7 +48,7 @@ struct Frame {
   forest:  vec4f,      // tree density, tree spacing (m), tree height (m), conifer share
   forest2: vec4f,      // autumn colour, treeline (m above water), snowline (m above water), clearings
   biome:   vec4f,      // rock exposure, wetland, basin depth (lakes), broadleaf style (0 temperate, 1 tropical)
-  mist:    vec4f,      // valley mist density, mist top (m above water), -, terrain seed
+  mist:    vec4f,      // valley mist density, mist top (m above water), canyon (0 valley, 1 plateau gorge), terrain seed
   water:   vec4f,      // water level at z = 0 (m), downstream slope, water tint (0 clear, 1 tannin), coast (0 inland, 1 shoreline)
 };
 `;

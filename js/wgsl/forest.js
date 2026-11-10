@@ -50,6 +50,14 @@ fn treeCell(cell: vec2i, sampleMasks: bool, dens0: f32, conif0: f32) -> Tree {
   t.tint = unit16(h3);
   t.hue = unit16(h3 >> 16u);
   t.seed = f32(h0 & 1023u);
+  if (F.mist.z > 0.5) {
+    // juniper: a low rounded shrub, not a spruce cone
+    t.conifer = false;
+    let szj = sz * 0.72;
+    t.top = F.forest.z * szj;
+    t.r = min(sp * 0.46 * sqrt(szj), sp * 0.55);
+    t.base = t.top * 0.22;
+  }
   return t;
 }
 
@@ -149,6 +157,9 @@ fn tropicalAlbedo(t: Tree) -> vec3f {
   return c * (0.8 + 0.35 * t.tint);
 }
 fn treeAlbedo(t: Tree) -> vec3f {
+  if (F.mist.z > 0.5) {
+    return mix(vec3f(0.040, 0.050, 0.018), vec3f(0.072, 0.068, 0.026), t.hue) * (0.8 + 0.4 * t.tint);
+  }
   if (t.conifer) { return coniferAlbedo(t); }
   if (F.biome.w > 0.5) { return tropicalAlbedo(t); }
   // only part of a stand turns at once
@@ -157,6 +168,7 @@ fn treeAlbedo(t: Tree) -> vec3f {
 }
 // Mean foliage albedo of a stand, for the far field.
 fn standAlbedo(conif: f32) -> vec3f {
+  if (F.mist.z > 0.5) { return vec3f(0.052, 0.058, 0.024); }
   let con = vec3f(0.026, 0.044, 0.027);
   var broad = vec3f(0.049, 0.078, 0.029);
   if (F.biome.w > 0.5) { broad = vec3f(0.056, 0.092, 0.029); }

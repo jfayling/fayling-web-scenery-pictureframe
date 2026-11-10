@@ -125,6 +125,25 @@ export const SCENES = [
     flight: { agl: 340, speed: 66, pitch: -17, fov: 58, offshore: 360 },
     sky: { sunElev: 28, sunAzim: -82, haze: 1.5, clouds: 0.18, cloudAltitude: 2.2, veil: 0.1 },
   },
+  {
+    id: 'canyon',
+    name: 'Grand Canyon',
+    place: 'Colorado Plateau, Arizona',
+    seed: 2841,
+    canyon: 1,
+    // relief is the drop from the Kaibab rim to the river. valleyWidth scales the
+    // gorge (3200 is the width this scene is drawn for). The river is the Colorado.
+    relief: 1520, ridge: 0.35, featureScale: 7800, gully: 0.95,
+    valleyWidth: 3200, floodplain: 180, river: 46, floor: 2.0,
+    path: [2200, 860, 300], pathLen: [36000, 16000, 7000], meander: 55, meanderLen: 2600,
+    density: 0.42, spacing: 13.0, height: 7, conifer: 1.0,
+    autumn: 0.0, treeline: 5000, snowline: 5000, clearings: 0.46,
+    rock: 1.0, wetland: 0.0, basin: 0.0, tropical: 0,
+    mist: 0.02, mistTop: 24,
+    water: 860, waterSlope: 0.0007, tannin: 1.0,
+    flight: { agl: 480, speed: 64, pitch: -11, fov: 56 },
+    sky: { sunElev: 27, sunAzim: 104, haze: 0.55, clouds: 0.06, cloudAltitude: 7.2, veil: 0.04 },
+  },
 ];
 
 export function sceneById(id) {
@@ -156,7 +175,7 @@ export function sceneUniforms(f, scene, visit, mul) {
   f[122] = scene.height * mul.height; f[123] = scene.conifer;
   f[124] = scene.autumn; f[125] = scene.treeline; f[126] = scene.snowline; f[127] = scene.clearings;
   f[128] = scene.rock; f[129] = scene.wetland; f[130] = scene.basin; f[131] = scene.tropical;
-  f[132] = scene.mist * mul.mist; f[133] = scene.mistTop; f[134] = 0; f[135] = seed;
+  f[132] = scene.mist * mul.mist; f[133] = scene.mistTop; f[134] = scene.canyon ? 1 : 0; f[135] = seed;
   f[136] = scene.water; f[137] = scene.waterSlope; f[138] = scene.tannin; f[139] = scene.coast ? 1 : 0;
 
   const A = scene.path, M = scene.meander;
