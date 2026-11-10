@@ -112,7 +112,8 @@ export const SCENES = [
     seed: 4823,
     coast: 1,
     // valleyWidth is how far inland the coastal range reaches full height.
-    // floodplain is the width of a sandy cove; headlands override it with a cliff.
+    // floodplain scales the sandy coves. Along the shore those coves, the cliff
+    // height and the nearshore depth all vary.
     relief: 860, ridge: 0.58, featureScale: 6400, gully: 0.72,
     valleyWidth: 2600, floodplain: 170, river: 0, floor: 8,
     path: [2600, 1100, 340], pathLen: [26000, 9800, 3600], meander: 0, meanderLen: 1400,

@@ -327,8 +327,12 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
     var extK = mix(vec3f(0.45, 0.16, 0.12), vec3f(0.35, 0.55, 0.9), tannin);
     if (ocean) {
       deep = vec3f(0.004, 0.026, 0.052);
-      bed = vec3f(0.52, 0.44, 0.30) * (0.86 + 0.22 * snoise(xz * 0.03));
-      extK = vec3f(0.15, 0.045, 0.03);
+      let sandCol = vec3f(0.52, 0.44, 0.30) * (0.86 + 0.22 * snoise(xz * 0.03));
+      let rockCol = vec3f(0.15, 0.145, 0.13) * (0.78 + 0.28 * snoise(xz * 0.017 + vec2f(2.0, 5.0)));
+      let sandy = 1.0 - smoothstep(0.22, 0.78, shoreKind(xz.y));
+      bed = mix(rockCol, sandCol, sandy);
+      // sandy aprons stay clear enough to show the bottom; cliff water goes dark sooner
+      extK = mix(vec3f(0.22, 0.07, 0.045), vec3f(0.10, 0.032, 0.022), sandy);
     }
     let path = depth * (1.0 + 1.0 / max(V.y, 0.15));
     let ext = exp(-path * extK);

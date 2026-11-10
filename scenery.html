@@ -1386,6 +1386,11 @@ fn valleyDX(z: f32) -> f32 {
        + F.pathA.y * F.pathK.y * cos(F.pathK.y * z + F.pathPh.y)
        + F.pathA.z * F.pathK.z * cos(F.pathK.z * z + F.pathPh.z);
 }
+fn valleyD2X(z: f32) -> f32 {
+  return -F.pathA.x * F.pathK.x * F.pathK.x * sin(F.pathK.x * z + F.pathPh.x)
+       - F.pathA.y * F.pathK.y * F.pathK.y * sin(F.pathK.y * z + F.pathPh.y)
+       - F.pathA.z * F.pathK.z * F.pathK.z * sin(F.pathK.z * z + F.pathPh.z);
+}
 fn riverX(z: f32) -> f32 {
   let k = F.pathK.w;
   return valleyX(z) + F.pathA.w * (sin(k * z + F.pathPh.w) + 0.35 * sin(2.3 * k * z + 1.7 + F.pathPh.w));
@@ -1493,47 +1498,91 @@ fn coastOffset(xz: vec2f) -> f32 {
   return (xz.x - valleyX(xz.y)) * inverseSqrt(1.0 + s * s);
 }
 
-// Shoreline country. The coast path is the waterline. Coves run out as sand; headlands
-// stand up as cliffs. Seaward of the line the bed drops through a shelf into open ocean,
-// with a few stacks where a ridge fails to quite reach shore.
+// 0 is a sandy bay, 1 a headland cliff. The coast path supplies the long bends;
+// shorter noise cuts coves and bluffs into a single view.
+fn shoreKind(z: f32) -> f32 {
+  let bend = smoothstep(-0.0004, 0.0009, valleyD2X(z));
+  let n = snoise(vec2f(z * 0.0005, 5.7)) * 0.55
+        + snoise(vec2f(z * 0.0015, 2.4)) * 0.35
+        + snoise(vec2f(z * 0.0036, 8.6)) * 0.25;
+  return clamp(mix(0.06, 0.9, bend) + n * 0.42, 0.0, 1.0);
+}
+
+// Shoreline country. Bays carry a wide beach and a shallow sandy apron; headlands
+// stand up as cliffs and the bed falls away. Beach width, berm height and the
+// nearshore depth each change along the shore, so neighbouring coves do not match.
 fn coastHeight(xz: vec2f, texel: f32, m: f32, wl: f32) -> f32 {
   let z = xz.y;
-  let wig = snoise(vec2f(z * 0.00035, 3.1)) * 260.0
+  let kind = shoreKind(z);
+  let bayN = snoise(vec2f(z * 0.00095, 2.9)) * 0.5 + 0.5;
+  let noseN = snoise(vec2f(z * 0.0013, 6.4)) * 0.5 + 0.5;
+  var wig = snoise(vec2f(z * 0.00035, 3.1)) * 260.0
           + snoise(vec2f(z * 0.0013, 8.4)) * 70.0
           + snoise(vec2f(z * 0.006, 1.8)) * 16.0;
+  wig -= (1.0 - smoothstep(0.05, 0.45, kind)) * mix(25.0, 150.0, bayN);
+  wig += smoothstep(0.62, 1.0, kind) * mix(10.0, 45.0, noseN);
   let d = coastOffset(xz) + wig;
-  let cliff = smoothstep(-0.12, 0.38, snoise(vec2f(z * 0.00028, 5.7)));
   var micro = 0.0;
   if (texel < 24.0) {
     micro = snoise(xz * (1.0 / 61.0) + vec2f(3.3, 8.1)) * 1.3;
     if (texel < 6.0) { micro += snoise(xz * (1.0 / 17.0) + vec2f(9.4, 2.2)) * 0.4; }
   }
   if (d < 0.0) {
-    let depth = -d;
-    let near = 1.0 - exp(-depth / 70.0);
-    let shelf = smoothstep(180.0, 2800.0, depth);
-    let abyss = smoothstep(1600.0, 12000.0, depth);
-    var h = wl - 0.35 - near * 5.5 - shelf * 18.0 - abyss * 55.0;
-    if (texel < 24.0 && depth < 500.0) {
-      h += snoise(xz * 0.015 + vec2f(1.0, 4.0)) * 0.4 * (1.0 - shelf);
+    let dist = -d;
+    // shoal 1: a long shallow beach. shoal 0: deep water against the rock.
+    // Cliffs are mostly steep; a few keep a wave-cut platform.
+    let shelfN = clamp(0.5 + snoise(vec2f(z * 0.00055, 3.8)) * 0.38 + snoise(vec2f(z * 0.0017, 1.2)) * 0.32, 0.0, 1.0);
+    let plat = smoothstep(0.58, 0.88, snoise(vec2f(z * 0.00062, 9.1)));
+    // Beaches take the full range, from a long wading apron to a steep shoreface.
+    // Cliffs drop into deep water, except for an occasional rock platform.
+    let shoal = clamp(mix(shelfN, mix(0.0, 0.32, plat), smoothstep(0.32, 0.7, kind)), 0.0, 1.0);
+    let nearScale = mix(9.0, 240.0, shoal);
+    let nearAmp = mix(20.0, 2.2, shoal);
+    let shelf0 = mix(10.0, 420.0, shoal);
+    let shelf1 = mix(160.0, 3000.0, shoal);
+    let shelfAmp = mix(40.0, 5.5, shoal);
+    var h = wl - 0.15
+          - (1.0 - exp(-dist / nearScale)) * nearAmp
+          - smoothstep(shelf0, shelf1, dist) * shelfAmp
+          - smoothstep(1600.0, 11000.0, dist) * 48.0;
+    let shelfVar = snoise(vec2f(dist * 0.0015 + 3.2, z * 0.0008));
+    h += shelfVar * mix(1.2, 4.2, shoal) * smoothstep(25.0, 140.0, dist) * (1.0 - smoothstep(500.0, 2200.0, dist));
+    if (texel < 36.0) {
+      let bar = snoise(vec2f(dist * mix(0.02, 0.008, shoal), z * 0.0028 + 1.5));
+      h += bar * mix(0.35, 2.2, shoal) * (1.0 - smoothstep(20.0, 420.0, dist));
     }
+    h = min(h, wl - 0.18);
     let stackN = smoothstep(0.58, 0.82, snoise(xz * (1.0 / 420.0) + vec2f(4.2, 1.1)) * 0.5 + 0.5);
-    let stack = smoothstep(0.5, 0.84, m) * stackN * (0.3 + 0.7 * cliff) * (1.0 - smoothstep(40.0, 560.0, depth));
-    let stackH = wl + 5.0 + max(m - 0.35, 0.0) * 80.0;
+    let stack = smoothstep(0.5, 0.84, m) * stackN * (0.2 + 0.8 * kind) * (1.0 - smoothstep(30.0, 480.0, dist));
+    let stackH = wl + 4.0 + max(m - 0.35, 0.0) * 70.0 + kind * 18.0;
     return mix(h, stackH, stack);
   }
-  let beachW = mix(max(F.valley.y, 30.0), 18.0, cliff);
-  let bluff = mix(5.0, 34.0 + 100.0 * smoothstep(0.22, 0.78, m), cliff);
-  let face = smoothstep(0.0, mix(beachW, 12.0, cliff), d);
-  let terrace = mix(0.35, bluff, face);
-  let reach = max(F.valley.x, beachW + 500.0);
-  let rise = smoothstep(beachW * 0.55, reach, d);
+  let wN = snoise(vec2f(z * 0.0011, 1.6)) * 0.5 + 0.5;
+  let wN2 = snoise(vec2f(z * 0.0028, 6.2)) * 0.5 + 0.5;
+  let baseW = max(F.valley.y, 40.0);
+  let beachW = mix(mix(8.0, baseW * 3.4, pow(wN, 1.2)), mix(0.0, 16.0, wN2), smoothstep(0.26, 0.7, kind));
+  let k = smoothstep(0.16, 0.7, kind);
+  let cRaw = snoise(vec2f(z * 0.00062, 7.4)) * 0.55 + snoise(vec2f(z * 0.0019, 1.1)) * 0.45;
+  let c01 = clamp(cRaw, -1.0, 1.0) * 0.5 + 0.5;
+  let tall = smoothstep(0.32, 0.58, c01);
+  let faceW = mix(mix(16.0, 42.0, c01), mix(7.0, 14.0, c01), tall);
+  let riseW = mix(max(beachW, 12.0), faceW, k);
+  let u = clamp(d / riseW, 0.0, 1.0);
+  let berm = max(F.valley.w, 2.0) * mix(0.12, 0.72, snoise(vec2f(z * 0.0024, 4.1)) * 0.5 + 0.5);
+  let dune = smoothstep(120.0, 300.0, beachW) * mix(0.3, 2.6, wN2) * (1.0 - k);
+  let du = u - 0.78;
+  let beachShape = berm * smoothstep(0.0, 0.5, u) + dune * exp(-du * du * 16.0);
+  let cliffH = mix(mix(6.0, 34.0, c01), mix(70.0, 210.0, c01) * (0.62 + 0.38 * smoothstep(0.0, 0.5, m)), tall);
+  let cliffShape = cliffH * smoothstep(0.0, 0.65, u);
+  let hShore = mix(beachShape, cliffShape, k);
+  let reach = riseW + max(F.valley.x, 500.0);
+  let rise = smoothstep(riseW + 24.0, reach, d);
   let peaks = max(m - 0.04, 0.0) * F.relief.x;
-  var hLand = mix(terrace, max(terrace * 0.22, peaks), rise);
-  if (cliff < 0.5 && texel < 48.0) {
-    hLand += snoise(xz * (1.0 / 95.0) + vec2f(2.0, 6.0)) * 0.7 * (1.0 - rise) * smoothstep(1.2, 3.5, terrace);
+  var hLand = mix(hShore, max(hShore, peaks), rise);
+  if (k < 0.55 && texel < 48.0) {
+    hLand += snoise(xz * (1.0 / 95.0) + vec2f(2.0, 6.0)) * 0.65 * (1.0 - rise) * smoothstep(0.4, 2.2, hShore);
   }
-  return wl + hLand + micro * mix(0.2, 1.0, rise);
+  return wl + hLand + micro * mix(0.15, 1.0, rise);
 }
 
 // Terrain height in metres.
@@ -2540,8 +2589,12 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
     var extK = mix(vec3f(0.45, 0.16, 0.12), vec3f(0.35, 0.55, 0.9), tannin);
     if (ocean) {
       deep = vec3f(0.004, 0.026, 0.052);
-      bed = vec3f(0.52, 0.44, 0.30) * (0.86 + 0.22 * snoise(xz * 0.03));
-      extK = vec3f(0.15, 0.045, 0.03);
+      let sandCol = vec3f(0.52, 0.44, 0.30) * (0.86 + 0.22 * snoise(xz * 0.03));
+      let rockCol = vec3f(0.15, 0.145, 0.13) * (0.78 + 0.28 * snoise(xz * 0.017 + vec2f(2.0, 5.0)));
+      let sandy = 1.0 - smoothstep(0.22, 0.78, shoreKind(xz.y));
+      bed = mix(rockCol, sandCol, sandy);
+      // sandy aprons stay clear enough to show the bottom; cliff water goes dark sooner
+      extK = mix(vec3f(0.22, 0.07, 0.045), vec3f(0.10, 0.032, 0.022), sandy);
     }
     let path = depth * (1.0 + 1.0 / max(V.y, 0.15));
     let ext = exp(-path * extK);
@@ -3340,7 +3393,8 @@ const SCENES = [
     seed: 4823,
     coast: 1,
     // valleyWidth is how far inland the coastal range reaches full height.
-    // floodplain is the width of a sandy cove; headlands override it with a cliff.
+    // floodplain scales the sandy coves. Along the shore those coves, the cliff
+    // height and the nearshore depth all vary.
     relief: 860, ridge: 0.58, featureScale: 6400, gully: 0.72,
     valleyWidth: 2600, floodplain: 170, river: 0, floor: 8,
     path: [2600, 1100, 340], pathLen: [26000, 9800, 3600], meander: 0, meanderLen: 1400,
