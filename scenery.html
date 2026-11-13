@@ -5117,6 +5117,8 @@ const P = {
   rainStyle: 'rain',
   rainFollow: false,
   rainLightning: 0,
+  music: false,
+  musicVolume: 100,
 };
 const DEFAULTS = { ...P };
 
@@ -6507,7 +6509,7 @@ async function main() {
   const panelBody = document.getElementById('panel-body');
   const BOOL_KEYS = new Set(['showButtons', 'showInfo', 'clock', 'clock24h', 'clockSeconds', 'clockDate',
     'weather', 'weatherTemp', 'weatherFeels', 'weatherPrecip', 'weatherHumidity', 'weatherWind', 'weatherForecast', 'weatherAlerts',
-    'sceneLabel', 'sceneSky', 'autopilot', 'moon', 'stars', 'cloudMotion', 'rain', 'rainFollow']);
+    'sceneLabel', 'sceneSky', 'autopilot', 'moon', 'stars', 'cloudMotion', 'rain', 'rainFollow', 'music']);
   const STRING_KEYS = new Set(['clockStyle', 'clockColor', 'clockPosition', 'weatherZip', 'weatherUnit', 'weatherPosition',
     'sceneMode', 'scene', 'tourOrder', 'lookMode',
     'skyMode', 'zipCode', 'skyWhen', 'skyLapseStart', 'cloudMode', 'starMode', 'rainMode', 'rainStyle']);
@@ -6548,6 +6550,12 @@ async function main() {
       { settings: [
         ['showButtons', 'Onscreen buttons', 'toggle', 'Show', 'Hide'],
         ['showInfo', 'Onscreen information', 'toggle', 'Show', 'Hide'],
+      ] },
+    ] },
+    { title: 'Sound', groups: [
+      { settings: [
+        ['music', 'Background music', 'toggle', 'On', 'Off'],
+        ['musicVolume', 'Volume', 0, 100, 1, 'music'],
       ] },
     ] },
     { title: 'Scenery', groups: [
@@ -6895,6 +6903,51 @@ async function main() {
     panel.style.maxHeight = P.showButtons ? 'calc(100vh - 60px)' : 'calc(100vh - 20px)';
     placeClock();
   }
+  // Deployed next to the page as media/track001.mp3. loop restarts the file at the end;
+  // the ended handler covers players that ignore the loop flag.
+  const soundtrack = new Audio('media/track001.mp3');
+  soundtrack.loop = true;
+  soundtrack.preload = 'auto';
+  soundtrack.hidden = true;
+  document.body.append(soundtrack);
+  let musicErrorLogged = false;
+  function playSoundtrack() {
+    const pending = soundtrack.play();
+    if (!pending) return;
+    pending.catch((err) => {
+      if (err && err.name === 'NotAllowedError') return;
+      if (musicErrorLogged) return;
+      musicErrorLogged = true;
+      log('music: ' + (err && err.message ? err.message : err));
+    });
+  }
+  function applyMusicVolume() {
+    soundtrack.volume = Math.min(1, Math.max(0, P.musicVolume / 100));
+  }
+  function applyMusic() {
+    applyMusicVolume();
+    if (!P.music) {
+      soundtrack.pause();
+      return;
+    }
+    playSoundtrack();
+  }
+  soundtrack.addEventListener('ended', () => {
+    if (!P.music) return;
+    soundtrack.currentTime = 0;
+    playSoundtrack();
+  });
+  soundtrack.addEventListener('error', () => {
+    if (musicErrorLogged) return;
+    musicErrorLogged = true;
+    log('music: could not load media/track001.mp3');
+  });
+  // A saved "on" can load before the browser will allow sound. The next click or key starts it.
+  function resumeSoundtrack() {
+    if (P.music && soundtrack.paused) playSoundtrack();
+  }
+  addEventListener('pointerdown', resumeSoundtrack);
+  addEventListener('keydown', resumeSoundtrack);
   const clockWidget = document.getElementById('clock-widget');
   const clockTime = clockWidget.querySelector('.clock-time');
   const clockDate = clockWidget.querySelector('.clock-date');
@@ -7907,6 +7960,7 @@ async function main() {
         applyRainMode();
       }
       if (key === 'sceneLabel' && !value) hideSceneLabel();
+      if (key === 'music') applyMusic();
       keepManualSetting(key);
       rememberSettings();
       return true;
@@ -7950,6 +8004,7 @@ async function main() {
     }
     P[key] = value;
     const kind = control ? control.kind : '';
+    if (key === 'musicVolume') applyMusicVolume();
     if (key === 'rainIntensity') showRainReadout();
     if (key === 'rainIntensity' || key === 'rainLightning') updateRainClouds();
     if (kind === 'lut') needLUT = true;
@@ -8078,6 +8133,7 @@ async function main() {
   applyStarMode();
   applyWeather(true);
   applySkyMode();
+  applyMusic();
   showRainReadout();
   if (skyUsesPlace()) resolveZipCode();
   refreshPlaceLabel('zipCode');
