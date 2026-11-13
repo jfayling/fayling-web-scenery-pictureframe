@@ -98,7 +98,7 @@ export const P = {
   clockOpacity: 0.9,
   clockBackground: 0.18,
   weather: true,
-  weatherZip: '98101',
+  weatherZip: '30263',
   weatherRefresh: 15,
   weatherUnit: 'fahrenheit',
   weatherPosition: 'bottom-left',
@@ -115,12 +115,53 @@ export const P = {
   rainStyle: 'rain',
   rainFollow: false,
   rainLightning: 0,
-  music: false,
+  music: true,
   musicVolume: 100,
 };
 const DEFAULTS = { ...P };
 
+const loadingEl = document.getElementById('loading');
+const loadingStatus = document.getElementById('loading-status');
+const loadingBar = document.getElementById('loading-bar');
+
+function reportLoad(message, amount) {
+  if (loadingStatus && loadingStatus.textContent !== message) loadingStatus.textContent = message;
+  if (loadingBar) loadingBar.style.transform = `scaleX(${amount})`;
+}
+// Two frames so the status paints before the next long compile. The timeout keeps startup
+// moving if the tab is not painting.
+function paintLoad(message, amount) {
+  reportLoad(message, amount);
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => { if (!settled) { settled = true; resolve(); } };
+    requestAnimationFrame(() => requestAnimationFrame(finish));
+    setTimeout(finish, 80);
+  });
+}
+function releaseApp() {
+  for (const id of ['c', 'hud', 'toolbar', 'clock-widget', 'weather-widget', 'scene-label', 'panel']) {
+    document.getElementById(id)?.removeAttribute('inert');
+  }
+}
+function dismissLoad() {
+  if (!loadingEl || loadingEl.classList.contains('done')) return;
+  releaseApp();
+  loadingEl.classList.add('done');
+  loadingEl.setAttribute('aria-busy', 'false');
+  const remove = () => { if (loadingEl.isConnected) loadingEl.remove(); };
+  loadingEl.addEventListener('transitionend', (event) => {
+    if (event.propertyName === 'opacity') remove();
+  });
+  setTimeout(remove, 2400);
+}
+function dropLoad() {
+  releaseApp();
+  loadingEl?.remove();
+}
+
 function fail(msg) {
+  dropLoad();
   const el = document.getElementById('err');
   el.style.display = 'block';
   el.textContent = msg;
@@ -151,6 +192,7 @@ function wrapAngle(a) {
 }
 
 async function main() {
+  await paintLoad('Looking for a graphics device', 0.08);
   if (!navigator.gpu) fail('WebGPU is not available in this browser.');
   const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
   if (!adapter) fail('No WebGPU adapter found.');
@@ -160,6 +202,7 @@ async function main() {
   const features = [];
   if (hasTS) features.push('timestamp-query');
   if (hasF32Filter) features.push('float32-filterable');
+  await paintLoad('Starting the graphics device', 0.16);
   const device = await adapter.requestDevice({ requiredFeatures: features });
   device.lost.then((i) => log('device lost: ' + i.message));
   device.onuncapturederror = (e) => log('GPU error: ' + e.error.message);
@@ -193,6 +236,7 @@ async function main() {
     entries: entries.map((r, i) => ({ binding: i, resource: r })),
   });
 
+  await paintLoad('Preparing the sky and terrain', 0.24);
   const [transPipe, msPipe, skyViewPipe, apPipe, clipHeightPipe, clipDerivePipe, probePipe] = await Promise.all([
     computePipe(TRANS_LUT, 'transmittance'),
     computePipe(MS_LUT, 'multiscatter'),
@@ -226,6 +270,7 @@ async function main() {
   const transView = transLUT.createView();
   const msView = msLUT.createView();
   const skyView = skyLUT.createView();
+  await paintLoad('Loading the star catalogue', 0.42);
   const starMap = device.createTexture({
     label: 'Yale bright star catalogue',
     size: [STAR_MAP_WIDTH, STAR_MAP_HEIGHT],
@@ -297,6 +342,7 @@ async function main() {
   // --------------------------------------------------------------------------------------
   const MSAA = 1;
   const HDR = 'rgba16float';
+  await paintLoad('Preparing the landscape', 0.52);
   const [landMod, skyMod, downMod, upMod, compMod, rainInitPipe, rainDropPipe, rainDrawMod, rainMistMod, shadowPipe, reflPipe, treeLightPipe, treeGenPipe, treeMod] = await Promise.all([
     shader(landWGSL(hasF32Filter), 'land'), shader(SKY_BG, 'sky'), shader(BLOOM_DOWN, 'bloom down'),
     shader(BLOOM_UP, 'bloom up'), shader(COMPOSITE, 'composite'),
@@ -314,6 +360,7 @@ async function main() {
     color: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
     alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
   };
+  await paintLoad('Preparing the ground and forest', 0.7);
   const landPipe = await device.createRenderPipelineAsync({
     label: 'land', layout: 'auto',
     vertex: {
@@ -334,6 +381,7 @@ async function main() {
     multisample: { count: MSAA },
   });
   const [treeNearPipe, treeFarPipe] = await Promise.all([treePipe(false), treePipe(true)]);
+  await paintLoad('Preparing the sky', 0.82);
   const skyPipe = await device.createRenderPipelineAsync({
     label: 'sky', layout: 'auto',
     vertex: { module: skyMod, entryPoint: 'vs' },
@@ -366,6 +414,7 @@ async function main() {
   let rainActive = 0;
   let boltLife = 0, boltDur = 0.2, boltPower = 1, nextBolt = 2.5, lightningQuiet = true;
   let boltFlash = 0, boltOn = 0, boltX = 0, boltZ = 1, boltSeed = 1;
+  await paintLoad('Finishing the picture', 0.9);
   const downPipe = await device.createRenderPipelineAsync({
     label: 'bloom down', layout: 'auto',
     vertex: { module: downMod, entryPoint: 'vs' },
@@ -864,6 +913,7 @@ async function main() {
     if (e.code === 'KeyR') toggleShown('rain');
     if (e.code === 'KeyP') toggleShown('autopilot');
     if (e.code === 'KeyL' && uiReady) commitSetting('lookMode', P.lookMode === 'static' ? 'dynamic' : 'static');
+    if (e.code === 'KeyM') toggleShown('music');
     if (e.code === 'BracketRight') requestScene(nextTourIndex(1));
     if (e.code === 'BracketLeft') requestScene(P.sceneMode === 'tour' ? nextTourIndex(-1) : tour.idx);
   });
@@ -1471,6 +1521,7 @@ async function main() {
   // --------------------------------------------------------------------------------------
   // UI
   // --------------------------------------------------------------------------------------
+  await paintLoad('Opening the controls', 0.94);
   const panel = document.getElementById('panel');
   const settingsBtn = document.getElementById('settings');
   function setPanelOpen(open) {
@@ -1503,6 +1554,15 @@ async function main() {
     const held = P.lookMode === 'static';
     lookBtn.setAttribute('aria-pressed', String(!held));
     lookBtn.textContent = held ? 'Static look' : 'Dynamic look';
+  }
+  const musicBtn = document.getElementById('music');
+  musicBtn.addEventListener('click', (event) => {
+    event.stopPropagation();
+    toggleShown('music');
+  });
+  function applyMusicButton() {
+    musicBtn.setAttribute('aria-pressed', String(P.music));
+    musicBtn.textContent = P.music ? 'Music on' : 'Music off';
   }
   const panelBody = document.getElementById('panel-body');
   const BOOL_KEYS = new Set(['showButtons', 'showInfo', 'clock', 'clock24h', 'clockSeconds', 'clockDate',
@@ -1622,7 +1682,7 @@ async function main() {
       { title: 'Weather', groups: [
         { title: 'Location and updates', settings: [
           ['weather', 'Weather widget', 'toggle', 'Show', 'Hide'],
-          ['weatherZip', 'Location', 'text', 'Seattle, WA'],
+          ['weatherZip', 'Location', 'text', 'Newnan, GA'],
           ['weatherRefresh', 'Refresh (minutes)', 5, 60, 5, 'weather'],
           ['weatherUnit', 'Units', 'select', [
             ['fahrenheit', 'Fahrenheit / mph'],
@@ -1941,7 +2001,9 @@ async function main() {
     log('music: could not load media/track001.mp3');
   });
   // A saved "on" can load before the browser will allow sound. The next click or key starts it.
-  function resumeSoundtrack() {
+  // The music button handles its own gesture, so a press that turns music off is not also a resume.
+  function resumeSoundtrack(event) {
+    if (event.target instanceof Element && event.target.closest('#music')) return;
     if (P.music && soundtrack.paused) playSoundtrack();
   }
   addEventListener('pointerdown', resumeSoundtrack);
@@ -2152,6 +2214,7 @@ async function main() {
       ['H', 'Show or hide settings'],
       ['P', 'Autopilot or free flight'],
       ['L', 'Dynamic or static look'],
+      ['M', 'Turn music on or off'],
       ['[ ]', 'Previous or next scene'],
       ['T', 'Show or hide the clock'],
       ['F', 'Show or hide the weather'],
@@ -2958,7 +3021,10 @@ async function main() {
         applyRainMode();
       }
       if (key === 'sceneLabel' && !value) hideSceneLabel();
-      if (key === 'music') applyMusic();
+      if (key === 'music') {
+        applyMusic();
+        applyMusicButton();
+      }
       keepManualSetting(key);
       rememberSettings();
       return true;
@@ -3126,6 +3192,7 @@ async function main() {
   applyClock();
   applyAutopilotButton();
   applyLookButton();
+  applyMusicButton();
   applySceneControls();
   applyCloudMode();
   applyStarMode();
@@ -3158,6 +3225,7 @@ async function main() {
   let last = performance.now();
   let fpsAcc = 0, fpsN = 0, fpsT = 0;
   let shooting = false;
+  let awaitingPicture = true;
 
   function updateLightning(dt) {
     const amount = rainAmount();
@@ -3259,6 +3327,11 @@ async function main() {
     if (fixedDt) dt = fixedDt;
     advanceCloudMotion(dt);
     updateTour(dt);
+    if (awaitingPicture && tour.state !== 'wait') {
+      awaitingPicture = false;
+      reportLoad('Reading the ground ahead', 1);
+      dismissLoad();
+    }
     updateCamera(dt);
     simTime += dt;
     if (simTime > 4096) simTime -= 4096;
@@ -3291,6 +3364,11 @@ async function main() {
       needLUT = false;
     }
     encodeClips(cp);
+    if (awaitingPicture) {
+      let ready = 0;
+      for (let l = 0; l < CLIP_LEVELS; l++) ready += clipValid[l];
+      reportLoad('Reading the ground ahead', 0.97 + 0.03 * ready / CLIP_LEVELS);
+    }
     let doProbe = false;
     if (!probePending) {
       writeProbes();
@@ -3466,10 +3544,12 @@ async function main() {
 
   resize();
   addEventListener('resize', resize);
+  reportLoad('Reading the ground ahead', 0.97);
   requestAnimationFrame(frame);
 }
 
 main().catch((e) => {
+  dropLoad();
   const msg = 'init failed: ' + (e && e.stack || e);
   const el = document.getElementById('err');
   if (el) { el.style.display = 'block'; el.textContent = msg; }
