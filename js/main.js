@@ -115,7 +115,7 @@ export const P = {
   rainStyle: 'rain',
   rainFollow: false,
   rainLightning: 0,
-  music: true,
+  music: false,
   musicVolume: 100,
 };
 const DEFAULTS = { ...P };
