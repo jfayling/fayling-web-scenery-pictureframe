@@ -30,6 +30,8 @@ const TU = GPUTextureUsage;
 export const P = {
   sceneMode: 'tour',
   scene: 'pnw',
+  // Scene ids included when Scenes is Set. Order follows SCENES, which is the sequence order.
+  sceneSet: SCENES.map((scene) => scene.id),
   tourOrder: 'sequence',
   tourMinutes: 4,
   sceneLabel: true,
@@ -728,11 +730,34 @@ async function main() {
   function forestMul() {
     return { density: P.forestDensity, height: P.treeHeight, mist: P.mist };
   }
+  function tourLoops() {
+    return P.sceneMode === 'tour' || P.sceneMode === 'set';
+  }
+  // Tour walks every region. Set walks the checked scenes, in SCENES order.
+  function scenePool() {
+    if (P.sceneMode !== 'set') return SCENES.map((_, index) => index);
+    const chosen = new Set(Array.isArray(P.sceneSet) ? P.sceneSet : []);
+    const pool = [];
+    for (let i = 0; i < SCENES.length; i++) if (chosen.has(SCENES[i].id)) pool.push(i);
+    return pool.length ? pool : [tour.idx];
+  }
+  function openingSceneIndex() {
+    const requested = qs.has('scene') ? SCENES.findIndex((scene) => scene.id === P.scene) : -1;
+    if (P.sceneMode === 'single') return sceneIndex(P.scene);
+    if (P.sceneMode === 'set') {
+      const pool = scenePool();
+      return requested >= 0 && pool.includes(requested) ? requested : pool[0];
+    }
+    return requested >= 0 ? requested : 0;
+  }
   function nextTourIndex(step = 1) {
-    if (P.sceneMode !== 'tour') return sceneIndex(P.scene);
+    if (!tourLoops()) return sceneIndex(P.scene);
+    const pool = scenePool();
+    if (pool.length === 1) return pool[0];
     if (P.tourOrder === 'shuffle' && step > 0) {
+      while (shuffleBag.length && !pool.includes(shuffleBag[shuffleBag.length - 1])) shuffleBag.pop();
       if (!shuffleBag.length) {
-        for (let i = 0; i < SCENES.length; i++) if (i !== tour.idx) shuffleBag.push(i);
+        for (const i of pool) if (i !== tour.idx) shuffleBag.push(i);
         for (let i = shuffleBag.length - 1; i > 0; i--) {
           const j = Math.floor(Math.random() * (i + 1));
           [shuffleBag[i], shuffleBag[j]] = [shuffleBag[j], shuffleBag[i]];
@@ -740,7 +765,17 @@ async function main() {
       }
       return shuffleBag.pop();
     }
-    return (tour.idx + step + SCENES.length) % SCENES.length;
+    const at = pool.indexOf(tour.idx);
+    if (at < 0) {
+      // The scene on screen was just removed from the set. Keep going in the same direction.
+      if (step < 0) {
+        for (let i = pool.length - 1; i >= 0; i--) if (pool[i] < tour.idx) return pool[i];
+        return pool[pool.length - 1];
+      }
+      for (const index of pool) if (index > tour.idx) return index;
+      return pool[0];
+    }
+    return pool[(at + step + pool.length) % pool.length];
   }
   function invalidateClips() {
     clipValid.fill(0);
@@ -945,7 +980,7 @@ async function main() {
     if (e.code === 'KeyL' && uiReady) commitSetting('lookMode', P.lookMode === 'static' ? 'dynamic' : 'static');
     if (e.code === 'KeyM') toggleShown('music');
     if (e.code === 'BracketRight') requestScene(nextTourIndex(1));
-    if (e.code === 'BracketLeft') requestScene(P.sceneMode === 'tour' ? nextTourIndex(-1) : tour.idx);
+    if (e.code === 'BracketLeft') requestScene(tourLoops() ? nextTourIndex(-1) : tour.idx);
   });
   function shortcutField(target) {
     return target instanceof Element && !!target.closest('input, textarea, select, [contenteditable="true"]');
@@ -1017,9 +1052,9 @@ async function main() {
   function updateAutopilot(dt) {
     const s = tour.scene;
     const route = s.flight.route;
-    // In tours the complete lunar route fits the selected duration at Speed=1.
+    // In a tour or a set, the complete lunar route fits the selected duration at Speed=1.
     // Single-scene mode keeps the scenic cruising speed and runs to the endpoint.
-    const v = (route && P.sceneMode === 'tour' ? route.length / (P.tourMinutes * 60) : s.flight.speed) * P.flightSpeed;
+    const v = (route && tourLoops() ? route.length / (P.tourMinutes * 60) : s.flight.speed) * P.flightSpeed;
     const slope = route ? route.slope(flight.z) : path.valleyDX(flight.z);
     flight.z -= v * dt / Math.sqrt(1 + slope * slope);
     if (s.body && flight.z < s.flight.endZ && tour.state !== 'out') requestScene(nextTourIndex());
@@ -1719,8 +1754,10 @@ async function main() {
       { title: 'Tour', settings: [
         ['sceneMode', 'Scenes', 'select', [
           ['tour', 'Tour all regions'],
+          ['set', 'Set'],
           ['single', 'One region'],
         ]],
+        ['sceneSet', 'In this set', 'checks'],
         ['scene', 'Region', 'select', SCENES.map((s) => [s.id, s.name]).sort((a, b) => a[1].localeCompare(b[1], 'en'))],
         ['tourOrder', 'Order', 'select', [
           ['sequence', 'In sequence'],
@@ -1919,7 +1956,24 @@ async function main() {
     if (setting[2] === 'select') CHOICES.set(setting[0], new Set(setting[3].map((option) => option[0])));
     else if (typeof setting[2] === 'number') RANGES.set(setting[0], [setting[2], setting[3]]);
   });
+  function normalizeSceneSet(raw) {
+    const items = Array.isArray(raw) ? raw : typeof raw === 'string' ? raw.split(',') : null;
+    if (!items) return undefined;
+    const known = new Set(SCENES.map((scene) => scene.id));
+    const chosen = new Set();
+    for (const item of items) {
+      const id = String(item ?? '').trim();
+      if (known.has(id)) chosen.add(id);
+    }
+    if (!chosen.size) return undefined;
+    return SCENES.filter((scene) => chosen.has(scene.id)).map((scene) => scene.id);
+  }
+  function sceneSetSignature(value) {
+    const ids = normalizeSceneSet(value);
+    return ids ? ids.join(',') : '';
+  }
   function coerceSetting(key, raw) {
+    if (key === 'sceneSet') return normalizeSceneSet(raw);
     if (key === 'rainStyle' && raw === 'hurricane') raw = 'thunderstorm';
     if (BOOL_KEYS.has(key)) return booleanSetting(raw);
     if (CHOICES.has(key)) return CHOICES.get(key).has(raw) ? raw : undefined;
@@ -1969,7 +2023,10 @@ async function main() {
     for (const key of Object.keys(P)) {
       if (visitOnly.has(key)) continue;
       const stored = storedSettingValue(key);
-      if (stored !== DEFAULTS[key]) changed[key] = stored;
+      const changedValue = key === 'sceneSet'
+        ? sceneSetSignature(stored) !== sceneSetSignature(DEFAULTS.sceneSet)
+        : stored !== DEFAULTS[key];
+      if (changedValue) changed[key] = stored;
     }
     return changed;
   }
@@ -2201,6 +2258,120 @@ async function main() {
     parent.appendChild(row);
     controls.set(key, { input: inp, row, kind: 'string', values: new Set(options.map((o) => o[0])) });
   }
+  function addSceneChecks(parent, key, label) {
+    const row = document.createElement('div');
+    row.className = 'scene-set';
+    const bar = document.createElement('div');
+    bar.className = 'scene-set-bar';
+    const name = document.createElement('span');
+    name.id = 'scene-set-label';
+    name.textContent = label;
+    const actions = document.createElement('span');
+    actions.className = 'scene-set-actions';
+    const allButton = document.createElement('button');
+    allButton.type = 'button';
+    allButton.textContent = 'All';
+    allButton.title = 'Include every scene';
+    const earthButton = document.createElement('button');
+    earthButton.type = 'button';
+    earthButton.textContent = 'Earth';
+    earthButton.title = 'Turn Earth scenes on or off';
+    earthButton.setAttribute('aria-pressed', 'false');
+    const moonButton = document.createElement('button');
+    moonButton.type = 'button';
+    moonButton.textContent = 'Moon';
+    moonButton.title = 'Turn Moon scenes on or off';
+    moonButton.setAttribute('aria-pressed', 'false');
+    actions.append(allButton, earthButton, moonButton);
+    bar.append(name, actions);
+    const list = document.createElement('div');
+    list.className = 'scene-set-list';
+    list.setAttribute('role', 'group');
+    list.setAttribute('aria-labelledby', name.id);
+    const checks = new Map();
+    const chosen = new Set(Array.isArray(P.sceneSet) ? P.sceneSet : []);
+    let showedEarth = false;
+    let showedMoon = false;
+    function checkedSceneIds() {
+      const ids = [];
+      for (const scene of SCENES) if (checks.get(scene.id).checked) ids.push(scene.id);
+      return ids;
+    }
+    for (const scene of SCENES) {
+      const lunar = Boolean(scene.body);
+      if (lunar && !showedMoon) {
+        const heading = document.createElement('div');
+        heading.className = 'scene-set-heading';
+        heading.textContent = 'Moon';
+        list.append(heading);
+        showedMoon = true;
+      } else if (!lunar && !showedEarth) {
+        const heading = document.createElement('div');
+        heading.className = 'scene-set-heading';
+        heading.textContent = 'Earth';
+        list.append(heading);
+        showedEarth = true;
+      }
+      const item = document.createElement('label');
+      const input = document.createElement('input');
+      input.type = 'checkbox';
+      input.value = scene.id;
+      input.checked = chosen.has(scene.id);
+      const text = document.createElement('span');
+      text.textContent = scene.name;
+      item.append(input, text);
+      input.addEventListener('change', () => {
+        const ids = checkedSceneIds();
+        if (!ids.length) {
+          input.checked = true;
+          note('Choose at least one scene');
+          return;
+        }
+        commitSetting(key, ids);
+      });
+      checks.set(scene.id, input);
+      list.append(item);
+    }
+    function toggleSceneGroup(lunar) {
+      const chosen = new Set(checkedSceneIds());
+      const group = SCENES.filter((scene) => Boolean(scene.body) === lunar);
+      const turnOff = group.every((scene) => chosen.has(scene.id));
+      for (const scene of group) {
+        if (turnOff) chosen.delete(scene.id);
+        else chosen.add(scene.id);
+      }
+      const ids = SCENES.filter((scene) => chosen.has(scene.id)).map((scene) => scene.id);
+      if (!ids.length) {
+        note('Choose at least one scene');
+        return;
+      }
+      commitSetting(key, ids);
+    }
+    allButton.addEventListener('click', () => commitSetting(key, SCENES.map((scene) => scene.id)));
+    earthButton.addEventListener('click', () => toggleSceneGroup(false));
+    moonButton.addEventListener('click', () => toggleSceneGroup(true));
+    row.append(bar, list);
+    parent.appendChild(row);
+    controls.set(key, {
+      row,
+      inputs: [allButton, earthButton, moonButton, ...checks.values()],
+      checks,
+      earthButton,
+      moonButton,
+      kind: 'checks',
+    });
+    syncSceneSetControl();
+  }
+  function syncSceneSetControl() {
+    const control = controls.get('sceneSet');
+    if (!control) return;
+    const chosen = new Set(P.sceneSet);
+    for (const [id, input] of control.checks) input.checked = chosen.has(id);
+    const earthOn = SCENES.filter((scene) => !scene.body).every((scene) => chosen.has(scene.id));
+    const moonOn = SCENES.filter((scene) => scene.body).every((scene) => chosen.has(scene.id));
+    control.earthButton.setAttribute('aria-pressed', String(earthOn));
+    control.moonButton.setAttribute('aria-pressed', String(moonOn));
+  }
   function addColor(parent, key, label) {
     const row = document.createElement('label');
     row.className = 'color';
@@ -2279,6 +2450,7 @@ async function main() {
   function addSetting(host, setting) {
     if (setting[2] === 'toggle') addToggle(host, setting[0], setting[1], setting[3], setting[4]);
     else if (setting[2] === 'select') addSelect(host, setting[0], setting[1], setting[3]);
+    else if (setting[2] === 'checks') addSceneChecks(host, setting[0], setting[1]);
     else if (setting[2] === 'color') addColor(host, setting[0], setting[1]);
     else if (setting[2] === 'text') addPlace(host, setting[0], setting[1]);
     else if (setting[2] === 'datetime') addDateTime(host, setting[0], setting[1]);
@@ -2439,9 +2611,13 @@ async function main() {
     const control = controls.get(key);
     if (!control?.row) return;
     control.row.hidden = !visible;
-    control.input.disabled = !visible;
+    const inputs = control.inputs || [control.input];
+    for (const input of inputs) {
+      if (!input) continue;
+      input.disabled = !visible;
+      if (control.kind !== 'checks' && input.required !== undefined) input.required = visible;
+    }
     control.row.classList.toggle('disabled', !visible);
-    if (control.input.required !== undefined) control.input.required = visible;
   }
   function refreshModeGroups() {
     const airless = Boolean(tour.scene.body?.airless);
@@ -2586,10 +2762,11 @@ async function main() {
     updateRainClouds();
   }
   function applySceneControls() {
-    const single = P.sceneMode !== 'tour';
-    setSettingVisible('scene', single);
-    setSettingVisible('tourOrder', !single);
-    setSettingVisible('tourMinutes', !single);
+    const mode = P.sceneMode;
+    setSettingVisible('scene', mode === 'single');
+    setSettingVisible('sceneSet', mode === 'set');
+    setSettingVisible('tourOrder', mode !== 'single');
+    setSettingVisible('tourMinutes', mode !== 'single');
     refreshModeGroups();
   }
   async function resolveZipCode() {
@@ -3091,6 +3268,16 @@ async function main() {
   function commitSetting(key, value) {
     if (!Object.hasOwn(P, key)) return false;
     visitOnly.delete(key);
+    if (key === 'sceneSet') {
+      const ids = normalizeSceneSet(value);
+      if (!ids) return false;
+      P.sceneSet = ids;
+      syncSceneSetControl();
+      shuffleBag.length = 0;
+      if (P.sceneMode === 'set' && !ids.includes(tour.scene.id)) requestScene(nextTourIndex(1));
+      rememberSettings();
+      return true;
+    }
     const control = controls.get(key);
     if (BOOL_KEYS.has(key)) {
       if (typeof value !== 'boolean') return false;
@@ -3155,10 +3342,13 @@ async function main() {
       if (key === 'starMode') applyStarMode();
       if (key === 'lookMode') applyLookButton();
       if (key === 'sceneMode') {
+        shuffleBag.length = 0;
         applySceneControls();
         if (value === 'single' && tour.scene.id !== P.scene) requestScene(sceneIndex(P.scene));
+        if (value === 'set' && !P.sceneSet.includes(tour.scene.id)) requestScene(nextTourIndex(1));
       }
-      if (key === 'scene' && value !== prev && P.sceneMode !== 'tour') requestScene(sceneIndex(value));
+      if (key === 'tourOrder') shuffleBag.length = 0;
+      if (key === 'scene' && value !== prev && P.sceneMode === 'single') requestScene(sceneIndex(value));
       if (key === 'skyLapseStart') resetTimeLapse();
       if (key === 'zipCode' || key === 'skyWhen' || key === 'skyLapseStart') resolveZipCode();
       keepManualSetting(key);
@@ -3233,7 +3423,8 @@ async function main() {
     let count = 0;
     for (const key of Object.keys(P)) {
       if (!Object.hasOwn(data, key)) continue;
-      const value = BOOL_KEYS.has(key) ? booleanSetting(data[key])
+      const value = key === 'sceneSet' ? data[key]
+        : BOOL_KEYS.has(key) ? booleanSetting(data[key])
         : STRING_KEYS.has(key) ? data[key] : Number(data[key]);
       if (commitSetting(key, value)) count++;
     }
@@ -3292,7 +3483,7 @@ async function main() {
   });
 
   // first scene
-  startScene(P.sceneMode === 'tour' ? (qs.has('scene') ? sceneIndex(P.scene) : 0) : sceneIndex(P.scene));
+  startScene(openingSceneIndex());
   uiReady = true;
   applyShowInfo();
   applyClock();
