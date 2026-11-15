@@ -12,7 +12,7 @@ import { TREE_RANGE, TREE_MAX } from './wgsl/common.js';
 import { BLOOM_DOWN, BLOOM_UP, COMPOSITE } from './wgsl/post.js';
 import { RAIN_DROP_INIT, RAIN_DROP_UPDATE, RAIN_DRAW, RAIN_MIST, MAX_DROPS } from './wgsl/rain.js';
 import { SCENES, sceneUniforms } from './scenes.js';
-import { decodeMoonTerrain } from './planet-terrain.js';
+import { decodeLunarAtlas } from './planet-terrain.js';
 import { celestialState } from './astronomy.js';
 import { createStarMapData, STAR_MAP_WIDTH, STAR_MAP_HEIGHT } from './star-catalog.js';
 import { createWeatherWidget, rainPresetForObservation } from './weather.js';
@@ -268,7 +268,7 @@ async function main() {
     addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge', addressModeW: 'clamp-to-edge',
   });
   const frameUBO = mkBuf(608, GU.UNIFORM | GU.COPY_DST, 'frame ubo');
-  const moonHeights = await decodeMoonTerrain();
+  const moonHeights = await decodeLunarAtlas();
   const planetDEM = mkBuf(moonHeights.byteLength, GU.STORAGE | GU.COPY_DST, 'Moon elevation');
   device.queue.writeBuffer(planetDEM, 0, moonHeights);
   const transView = transLUT.createView();

@@ -42,7 +42,28 @@ test('look-ahead clamps outside endpoints and Earth retains its existing flight 
   assert.equal(route.x(route.startZ + 10000), route.x(route.startZ));
   assert.equal(route.agl(route.endZ - 10000), route.agl(route.endZ));
   assert(Math.abs(route.slope(route.endZ - 10000)) === 0);
-  for (const scene of SCENES.filter((s) => s.id !== 'moon')) assert.equal(scene.flight.route, undefined);
+  for (const scene of SCENES.filter((s) => !s.body)) assert.equal(scene.flight.route, undefined);
   assert.throws(() => createCameraRoute([]));
   assert.throws(() => createCameraRoute([{ x: 0, z: 0, agl: 1, pitch: 0 }, { x: 0, z: 1, agl: 1, pitch: 0 }]));
+});
+
+test('every lunar route stays within its own terrain and completes a four-minute tour', () => {
+  const lunar = SCENES.filter((s) => s.body);
+  assert.equal(lunar.length, 5);
+  assert.equal(new Set(lunar.map((s) => s.body.demOffset)).size, 5);
+  for (const scene of lunar) {
+    const r = scene.flight.route;
+    assert.equal(scene.flight.startZ, r.startZ);
+    assert.equal(scene.flight.endZ, r.endZ);
+    let z = r.startZ, elapsed = 0;
+    while (z > r.endZ && elapsed < 242) {
+      assert(Math.abs(r.x(z)) < scene.body.halfWidth - 10000, scene.id);
+      assert(Math.abs(z) < scene.body.halfHeight - 10000, scene.id);
+      assert(r.agl(z) >= 1000 && r.agl(z) <= 10000, scene.id);
+      assert(r.pitch(z) < 0 && Number.isFinite(r.slope(z)), scene.id);
+      z -= (r.length / 240) / 60 / Math.hypot(1, r.slope(z));
+      elapsed += 1 / 60;
+    }
+    assert(Math.abs(elapsed - 240) < 0.1, scene.id);
+  }
 });

@@ -1,5 +1,6 @@
 // Windows GPU integration check. Starts its own server and headless Chrome.
 // node tools/check-scenes.mjs (CHROME_PATH can override the executable)
+// Optional arguments select named render checks; transition checks always run.
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -74,14 +75,22 @@ try {
     }
     throw new Error('Scene startup timed out');
   };
-  for (const [name, url] of [
+  const renderChecks = [
     ['moon', 'http://localhost:8092/?scene=moon&ui=0&rain=true'],
     ['moon-floor', 'http://localhost:8092/?scene=moon&ui=0&z=12000&clock=false'],
     ['moon-exit', 'http://localhost:8092/?scene=moon&ui=0&z=-34000&clock=false'],
+    ...['aristarchus', 'hadley', 'tycho', 'orientale'].map((region) => [
+      `moon-${region}`, `http://localhost:8092/?scene=moon-${region}&ui=0&clock=false`,
+    ]),
+    ['moon-hadley-rille', 'http://localhost:8092/?scene=moon-hadley&ui=0&z=0&clock=false'],
+    ['moon-orientale-rings', 'http://localhost:8092/?scene=moon-orientale&ui=0&z=-166776&clock=false'],
     ['earth', 'http://localhost:8092/?scene=pnw&ui=0'],
-    ['moon-offline', pathToFileURL(path.join(root, 'scenery.html')).href + '?scene=moon&ui=0'],
-    ['moon-min-offline', pathToFileURL(path.join(root, 'scenery.min.html')).href + '?scene=moon&ui=0'],
-  ]) {
+    ['moon-offline', pathToFileURL(path.join(root, 'scenery.html')).href + '?scene=moon-hadley&ui=0'],
+    ['moon-min-offline', pathToFileURL(path.join(root, 'scenery.min.html')).href + '?scene=moon-orientale&ui=0'],
+  ];
+  const selected = process.argv.slice(2);
+  for (const name of selected) assert(renderChecks.some(([key]) => key === name), `Unknown render check: ${name}`);
+  for (const [name, url] of renderChecks.filter(([name]) => !selected.length || selected.includes(name))) {
     errors.length = 0;
     await send('Page.navigate', { url });
     await sleep(800);
@@ -90,12 +99,26 @@ try {
     fs.writeFileSync(path.join(root, 'shots', `check-${name}.png`), Buffer.from(screenshot.data, 'base64'));
     const trees = await evaluate('window.__trees');
     assert.equal((await evaluate('window.__checkGPU')).length, 0);
-    if (name.startsWith('moon')) assert.deepEqual(trees, [0, 0]);
+    if (name.startsWith('moon')) assert(trees?.length > 0 && trees.every((count) => count === 0));
     console.log(`${name}: rendered, no shader/runtime errors; trees=${JSON.stringify(trees)}`);
   }
   // Force a Moon-to-Earth transition through the actual Next scene button.
   await send('Page.navigate', { url: 'http://localhost:8092/?scene=moon&sceneMode=tour&ui=0' });
   await sleep(800); await waitReady();
+  // Every lunar-to-lunar transition must select new terrain without reloading.
+  for (const name of ['Aristarchus', 'Hadley', 'Tycho', 'Orientale']) {
+    await evaluate(`document.getElementById('next-scene').click()`);
+    for (let n = 0; n < 90; n++) {
+      if ((await evaluate(`document.getElementById('scene-label').textContent`)).includes(name)) break;
+      await sleep(500);
+    }
+    assert((await evaluate(`document.getElementById('scene-label').textContent`)).includes(name));
+    await sleep(3000);
+    assert.equal((await evaluate('window.__checkGPU')).length, 0);
+    assert.equal(errors.length, 0, errors.join('\n'));
+    assert((await evaluate('window.__trees')).every((count) => count === 0));
+    console.log(`Transition to ${name} passed.`);
+  }
   await evaluate(`document.getElementById('next-scene').click()`);
   for (let n = 0; n < 90; n++) {
     if ((await evaluate(`document.getElementById('scene-label').textContent`)).includes('Pacific Northwest')) break;
@@ -109,10 +132,10 @@ try {
   // Reverse transition restores the lunar environment without reloading the page.
   await evaluate(`window.dispatchEvent(new KeyboardEvent('keydown', {code: 'BracketLeft'}))`);
   for (let n = 0; n < 90; n++) {
-    if ((await evaluate(`document.getElementById('scene-label').textContent`)).includes('Copernicus')) break;
+    if ((await evaluate(`document.getElementById('scene-label').textContent`)).includes('Orientale')) break;
     await sleep(500);
   }
-  assert((await evaluate(`document.getElementById('scene-label').textContent`)).includes('Copernicus'));
+  assert((await evaluate(`document.getElementById('scene-label').textContent`)).includes('Orientale'));
   assert.equal(await evaluate(`document.querySelector('.section[data-earth-only]').hidden`), true);
   assert.equal((await evaluate('window.__checkGPU')).length, 0);
   console.log('Earth-to-Moon transition and environment controls passed.');

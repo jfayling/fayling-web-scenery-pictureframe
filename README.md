@@ -28,7 +28,7 @@ After editing anything under `js/`, run `npm run build` to regenerate both bundl
 
 ## The tour
 
-By default the frame tours nine Earth regions and the Moon, about four minutes each, fading through black between them. Each region has its own landform, forest, water, flight altitude and speed, and a matching sky (sun height and direction, haze, clouds). A small label names the region as it fades in.
+By default the frame tours nine Earth regions and five lunar regions, about four minutes each, fading through black between them. Each region has its own landform, flight altitude, speed, and sky. Earth regions also have forest and water settings. A small label names the region as it fades in.
 
 | Region | Character |
 |---|---|
@@ -44,11 +44,20 @@ By default the frame tours nine Earth regions and the Moon, about four minutes e
 
 Settings → **Scenery** chooses between the tour (in order or shuffled) and a single region, how long each region lasts, and whether each region brings its own sky. `?scene=alpine` in the URL shows one region.
 
-## Moon scene
+## Moon scenes
 
-Under Settings → Scenery, select **One region**, then **Moon · Copernicus**.
-Alternatively, open `?scene=moon`.
-The scene uses a bundled NASA/SELENE elevation crop and works offline.
+Under Settings → Scenery, select **One region**, then a **Moon** region.
+The scenes use bundled NASA/SELENE elevation crops and work offline.
+Each scene has its own camera route, terrain clearance, and lighting.
+
+| Region | URL parameter |
+|---|---|
+| Copernicus | `?scene=moon` |
+| Aristarchus Plateau | `?scene=moon-aristarchus` |
+| Hadley–Apennine | `?scene=moon-hadley` |
+| Tycho | `?scene=moon-tycho` |
+| Orientale | `?scene=moon-orientale` |
+
 See [Moon terrain](docs/planet-terrain.md) for data sources, resolution, visual limits, and rebuild instructions.
 
 ![Moon: Copernicus crater](docs/moon.png)

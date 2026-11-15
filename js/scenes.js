@@ -3,9 +3,8 @@
 // FRAME_WGSL) and returns JS mirrors of the valley path functions in wgsl/terrain.js so
 // the flight follows the same valley the shaders carve.
 
-import { MOON_DEM } from './moon-data.js';
 import { createCameraRoute } from './camera-route.js';
-import { MOON_SPAN_X, MOON_SPAN_Z } from './planet-terrain.js';
+import { LUNAR_TERRAINS } from './planet-terrain.js';
 
 const TAU = Math.PI * 2;
 
@@ -169,11 +168,16 @@ export const SCENES = [
   },
 ];
 
+function lunarBody(id) {
+  const { dem, spanX, spanZ, offset } = LUNAR_TERRAINS[id];
+  return { airless: true, radius: dem.radius, min: dem.min, max: dem.max,
+    halfWidth: spanX / 2, halfHeight: spanZ / 2, demSize: dem.width, demOffset: offset };
+}
+
 SCENES.push({
   id: 'moon', name: 'Moon · Copernicus',
   place: 'Copernicus crater · measured NASA/SELENE terrain',
-  body: { airless: true, radius: MOON_DEM.radius, min: MOON_DEM.min, max: MOON_DEM.max,
-    halfWidth: MOON_SPAN_X / 2, halfHeight: MOON_SPAN_Z / 2 },
+  body: lunarBody('moon'),
   seed: 0, relief: 7000, ridge: 0, featureScale: 8000, gully: 0,
   valleyWidth: 0, floodplain: 0, river: 0, floor: 0,
   path: [0, 0, 0], pathLen: [10000, 10000, 10000], meander: 0, meanderLen: 10000,
@@ -194,6 +198,61 @@ SCENES.push({
   },
   sky: { sunElev: 18, sunAzim: 110, haze: 0, clouds: 0, cloudAltitude: 2, veil: 0 },
 });
+
+// Geographic waypoints keep each flight tied to its measured landmarks.
+// Latitude increases along a route; local +x is east and +z is south.
+function addLunarScene(id, name, place, speed, sunElev, sunAzim, waypoints) {
+  const { dem } = LUNAR_TERRAINS[id];
+  const scale = dem.radius * Math.PI / 180;
+  const points = waypoints.map(([latitude, longitude, agl, pitch]) => ({
+    x: (longitude - dem.centerLongitude) * scale * Math.cos(dem.centerLatitude * Math.PI / 180),
+    z: (dem.centerLatitude - latitude) * scale, agl, pitch,
+  }));
+  const route = createCameraRoute(points);
+  const base = SCENES.find((scene) => scene.id === 'moon');
+  SCENES.push({ ...base, id, name: `Moon · ${name}`,
+    place: `${place} · measured NASA/SELENE terrain`, body: lunarBody(id),
+    flight: { agl: points[0].agl, speed, pitch: points[0].pitch, fov: 58,
+      startZ: route.startZ, endZ: route.endZ, route },
+    sky: { ...base.sky, sunElev, sunAzim },
+  });
+}
+
+addLunarScene('moon-aristarchus', 'Aristarchus Plateau', 'Vallis Schröteri and Aristarchus crater', 170, 20, 105, [
+  [22.4, 312.5, 4200, -22], // approach Aristarchus from the southern plain
+  [23.7, 312.0, 3000, -24], // western crater wall
+  [24.5, 311.0, 2200, -20], // plateau toward the valley mouth
+  [25.2, 310.4, 1800, -22], // Cobra Head region
+  [26.0, 309.0, 2300, -20], // sweep west over the winding valley
+  [27.4, 309.5, 3500, -18], // northern plateau
+]);
+
+addLunarScene('moon-hadley', 'Hadley–Apennine', 'Hadley Rille and the Apollo 15 region', 95, 24, 115, [
+  [25.0, 3.5, 3000, -22], // southern mountain approach
+  [25.6, 3.3, 1900, -22], // descend toward the rille
+  [26.0, 3.55, 1400, -25], // Apollo 15 region
+  [26.4, 3.6, 1600, -23], // rille beside the mountain front
+  [26.8, 3.9, 2400, -20],
+  [27.2, 4.2, 3200, -18], // climb out alongside Mons Hadley
+]);
+
+addLunarScene('moon-tycho', 'Tycho', 'Terraced walls and central peaks', 160, 17, 100, [
+  [-45.4, 349.2, 5000, -20], // southern highlands
+  [-44.5, 349.0, 3900, -24], // southern rim
+  [-43.7, 348.5, 2600, -23], // floor west of the central peaks
+  [-43.2, 348.4, 2500, -20],
+  [-42.4, 349.0, 4100, -22], // northern terraces
+  [-41.3, 349.2, 5000, -18],
+]);
+
+addLunarScene('moon-orientale', 'Orientale', 'Northern basin and the Rook mountain rings', 350, 16, 110, [
+  [-16.5, 264.0, 5500, -20], // northern basin floor, facing the mountains
+  [-15.5, 263.5, 5500, -18],
+  [-14.5, 263.5, 6000, -20], // mountain approach
+  [-13.5, 264.0, 6500, -22],
+  [-12.5, 264.5, 7000, -22], // climb through the Rook mountains
+  [-11.0, 265.5, 7500, -20],
+]);
 
 export function sceneById(id) {
   return SCENES.find((s) => s.id === id) || SCENES[0];
@@ -230,7 +289,8 @@ export function sceneUniforms(f, scene, visit, mul) {
   const body = scene.body;
   f[144] = body?.airless ? 1 : 0; f[145] = body?.radius ?? 6371000;
   f[146] = body?.min ?? 0; f[147] = body?.max ?? 0;
-  f[148] = body?.halfWidth ?? 0; f[149] = body?.halfHeight ?? 0; f[150] = 0; f[151] = 0;
+  f[148] = body?.halfWidth ?? 0; f[149] = body?.halfHeight ?? 0;
+  f[150] = body?.demSize ?? 0; f[151] = body?.demOffset ?? 0;
 
   const A = scene.path, M = scene.meander;
   const valleyX = (z) => A[0] * Math.sin(k[0] * z + ph[0]) + A[1] * Math.sin(k[1] * z + ph[1]) + A[2] * Math.sin(k[2] * z + ph[2]);

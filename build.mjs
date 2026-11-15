@@ -13,7 +13,8 @@ import { fileURLToPath } from 'node:url';
 const root = path.dirname(fileURLToPath(import.meta.url));
 const wgslModules = ['js/wgsl/common.js', 'js/wgsl/sky.js', 'js/wgsl/terrain.js', 'js/wgsl/forest.js', 'js/wgsl/rain.js', 'js/wgsl/land.js', 'js/wgsl/trees.js', 'js/wgsl/post.js'];
 const appModules = ['js/camera-route.js', 'js/scenes.js', 'js/astronomy.js', 'js/star-catalog.js', 'js/place.js', 'js/weather.js'];
-const order = ['js/moon-data.js', 'js/planet-terrain.js', ...wgslModules, ...appModules, 'js/main.js'];
+const lunarModules = ['js/moon-data.js', ...['aristarchus', 'hadley', 'tycho', 'orientale'].map((name) => `js/moon-${name}-data.js`)];
+const order = [...lunarModules, 'js/planet-terrain.js', ...wgslModules, ...appModules, 'js/main.js'];
 const stripModuleSyntax = (src) => src
   .replace(/^import[\s\S]*?from\s+['"][^'"]+['"];\s*$/gm, '')                 // drop imports
   .replace(/^export\s+(const|function|async function|let|class)\s/gm, '$1 ');

@@ -59,7 +59,7 @@ struct Frame {
   water:   vec4f,      // water level at z = 0 (m), downstream slope, water tint (0 clear, 1 tannin), coast (0 inland, 1 shoreline)
   falls:   vec4f,      // waterfall density (0 none), cliff run (m), spacing along the valley (m), width scale
   body:    vec4f,      // 0 Earth / 1 airless DEM, radius metres, minimum / maximum elevation
-  extent:  vec4f,      // DEM half-width / half-height metres, reserved
+  extent:  vec4f,      // DEM half-width / half-height metres, square size, atlas sample offset
 };
 `;
 

@@ -1,10 +1,11 @@
-"""Rebuild the bundled Copernicus DEM using verified HTTP byte ranges (stdlib only).
+"""Build offline lunar DEM crops from verified SLDEM2015 HTTP byte ranges.
 
-Source: NASA/GSFC/MIT SLDEM2015, Barker et al., Icarus 273 (2016), 346-355.
-The source label specifies little-endian float32 kilometres above 1737.4 km.
-Crop: 5..15 N, 335..345 E. Average 2x2 samples, quantize to integer metres.
-Run: python tools/prepare-moon.py (requires network access; ~315 MB downloaded).
+Python standard library only. Default: Copernicus. Use --all or region names.
+Use --repack to compress existing assets without downloading source data.
+Source floats are kilometres above the 1737.4 km lunar reference sphere.
 """
+import argparse
+import array
 import base64
 import concurrent.futures
 import gzip
@@ -12,77 +13,177 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import re
 import struct
+import sys
 import time
 import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
 BASE = 'https://imbrium.mit.edu/DATA/SLDEM2015/TILES/FLOAT_IMG/'
-PRODUCT = 'SLDEM2015_256_0N_60N_240_360_FLOAT'
-WIDTH, PPD, ROW_BYTES = 30720, 256, 122880
-ROW0, COL0, SIDE = 45 * PPD, 95 * PPD, 10 * PPD
-CACHE = ROOT / 'tools' / '.moon-cache' / '5N-15N-335E-345E'
+CODEC = 'gradient-zigzag-planar-gzip-v1'
+# product, source north/west, source ppd, crop north/south/west/east, averaging factor
+REGIONS = {
+    'copernicus': ('256_0N_60N_240_360', 60, 240, 256, 15, 5, 335, 345, 2),
+    'aristarchus': ('256_0N_60N_240_360', 60, 240, 256, 30, 20, 305, 315, 2),
+    'hadley': ('512_00N_30N_000_045', 30, 0, 512, 28, 24, 2, 6, 1),
+    'tycho': ('256_60S_0S_240_360', 0, 240, 256, -38, -48, 344, 354, 2),
+    'orientale': ('256_60S_0S_240_360', 0, 240, 256, -8, -32, 253, 277, 4),
+}
 
 
-def fetch_rows(offset):
-    count = min(64, SIDE - offset)
-    start = (ROW0 + offset) * ROW_BYTES
-    end = start + count * ROW_BYTES - 1
-    cached = CACHE / f'{offset}.bin'
-    if cached.exists() and cached.stat().st_size == count * SIDE * 4:
-        return offset, cached.read_bytes()
-    for attempt in range(4):
-        try:
-            req = urllib.request.Request(BASE + PRODUCT + '.IMG', headers={'Range': f'bytes={start}-{end}'})
-            with urllib.request.urlopen(req, timeout=90) as response:
-                if response.status != 206 or response.headers.get('Content-Range') != f'bytes {start}-{end}/1887436800':
-                    raise ValueError('Server did not honor the requested byte range')
-                data = response.read(end - start + 2)
-            if len(data) != end - start + 1:
-                raise ValueError('Incomplete range')
-            crop = b''.join(data[r * ROW_BYTES + COL0 * 4:r * ROW_BYTES + (COL0 + SIDE) * 4] for r in range(count))
-            cached.write_bytes(crop)
-            print(f'Rows {offset}..{offset + count}', flush=True)
-            return offset, crop
-        except Exception:
-            if attempt == 3:
-                raise
-            time.sleep(2 ** attempt)
+def encode_heights(raw, width):
+    """Lossless int16 gradient residuals, zigzag coded into low/high byte planes."""
+    heights = array.array('h')
+    heights.frombytes(raw)
+    if sys.byteorder != 'little':
+        heights.byteswap()
+    count = len(heights)
+    planes = bytearray(len(raw))
+    for i, height in enumerate(heights):
+        left = heights[i - 1] if i % width else 0
+        up = heights[i - width] if i >= width else 0
+        corner = heights[i - width - 1] if i >= width and i % width else 0
+        # Wrap signed residuals to 16 bits; decoding uses the same modular sum.
+        delta = ((height - (left + up - corner) + 32768) & 65535) - 32768
+        zigzag = (delta << 1) ^ (delta >> 15)
+        planes[i] = zigzag & 255
+        planes[count + i] = zigzag >> 8
+    return gzip.compress(planes, compresslevel=9, mtime=0)
 
 
-def main():
-    CACHE.mkdir(parents=True, exist_ok=True)
-    label = urllib.request.urlopen(BASE + PRODUCT + '.LBL', timeout=30).read()
-    (CACHE / (PRODUCT + '.LBL')).write_bytes(label)
-    rows = bytearray(SIDE * SIDE * 4)
+def asset_path(name):
+    return ROOT / 'js' / ('moon-data.js' if name == 'copernicus' else f'moon-{name}-data.js')
+
+
+def write_asset(name, metadata, raw):
+    if len(raw) != metadata['width'] * metadata['height'] * 2:
+        raise ValueError('Invalid elevation byte count')
+    if hashlib.sha256(raw).hexdigest() != metadata['sha256']:
+        raise ValueError('Elevation checksum mismatch')
+    metadata['codec'] = CODEC
+    metadata['encoding'] = metadata['encoding'].replace('gzip, little-endian int16 metres',
+                                                       'gradient prediction, zigzag byte planes, gzip; int16 metres')
+    encoded = base64.b64encode(encode_heights(raw, metadata['width'])).decode()
+    prefix = 'MOON' if name == 'copernicus' else name.upper()
+    out = asset_path(name)
+    out.write_text('// Generated by tools/prepare-moon.py. NASA/GSFC/MIT SLDEM2015.\n'
+                   + f'export const {prefix}_DEM = ' + json.dumps(metadata, indent=2) + ';\n'
+                   + f'export const {prefix}_DEM_GZIP = ' + json.dumps(encoded) + ';\n', encoding='utf-8', newline='\n')
+    print(f'{name}: {metadata["width"]} square, {metadata["min"]}..{metadata["max"]} m, {out.stat().st_size} bytes', flush=True)
+
+
+def repack(name):
+    text = asset_path(name).read_text(encoding='utf-8')
+    metadata = json.loads(re.search(r'export const \w+_DEM = (\{.*?\});', text, re.S)[1])
+    if metadata.get('codec') == CODEC:
+        print(f'{name}: already uses {CODEC}', flush=True)
+        return
+    if 'codec' in metadata or not metadata['encoding'].startswith('gzip, little-endian int16 metres;'):
+        raise ValueError('Unsupported source encoding')
+    encoded = json.loads(re.search(r'export const \w+_DEM_GZIP = ("[^"]+");', text)[1])
+    raw = gzip.decompress(base64.b64decode(encoded, validate=True))
+    write_asset(name, metadata, raw)
+
+
+def download(url, headers=None):
+    return urllib.request.urlopen(urllib.request.Request(url, headers=headers or {}), timeout=90)
+
+
+def prepare(name):
+    product, tile_north, tile_west, ppd, north, south, west, east, factor = REGIONS[name]
+    product = 'SLDEM2015_' + product + '_FLOAT'
+    cache = ROOT / 'tools' / '.moon-cache' / f'{product}-{north}-{south}-{west}-{east}'
+    cache.mkdir(parents=True, exist_ok=True)
+    label_path = cache / (product + '.LBL')
+    if not label_path.exists():
+        with download(BASE + product + '.LBL') as response:
+            label_path.write_bytes(response.read())
+    label = label_path.read_text()
+    def field(key):
+        match = re.search(r'^\s*' + key + r'\s*=\s*([^\r\n]+)', label, re.M)
+        if not match:
+            raise ValueError(f'Missing source label field {key}')
+        return match[1].strip()
+    width, lines = int(field('LINE_SAMPLES')), int(field('LINES'))
+    if field('SAMPLE_TYPE') != 'PC_REAL' or int(field('SAMPLE_BITS')) != 32:
+        raise ValueError('Unsupported source sample format')
+    if (field('UNIT') != 'KILOMETER' or float(field('SCALING_FACTOR')) != 1
+            or float(field('OFFSET')) != 1737.4
+            or float(field('MAP_RESOLUTION').split()[0]) != ppd
+            or float(field('MAXIMUM_LATITUDE').split()[0]) != tile_north
+            or float(field('WESTERNMOST_LONGITUDE').split()[0]) != tile_west):
+        raise ValueError('Source label does not match the expected units or map coordinates')
+    row_bytes, total_bytes = width * 4, width * lines * 4
+    row0, col0 = (tile_north - north) * ppd, (west - tile_west) * ppd
+    side = (north - south) * ppd
+    if side != (east - west) * ppd or side % factor or not (0 <= row0 <= lines - side and 0 <= col0 <= width - side):
+        raise ValueError('Crop must be square, divisible by averaging factor, and inside source tile')
+
+    def fetch_rows(offset):
+        count = min(64, side - offset)
+        cached = cache / f'{offset}.bin'
+        if cached.exists() and cached.stat().st_size == count * side * 4:
+            return offset, cached.read_bytes()
+        start = (row0 + offset) * row_bytes
+        end = start + count * row_bytes - 1
+        for attempt in range(4):
+            try:
+                with download(BASE + product + '.IMG', {'Range': f'bytes={start}-{end}'}) as response:
+                    if response.status != 206 or response.headers.get('Content-Range') != f'bytes {start}-{end}/{total_bytes}':
+                        raise ValueError('Server did not honor the requested byte range')
+                    data = response.read(end - start + 2)
+                if len(data) != end - start + 1:
+                    raise ValueError('Incomplete range')
+                crop = b''.join(data[r * row_bytes + col0 * 4:r * row_bytes + (col0 + side) * 4] for r in range(count))
+                cached.write_bytes(crop)
+                return offset, crop
+            except Exception:
+                if attempt == 3:
+                    raise
+                time.sleep(2 ** attempt)
+
+    rows = bytearray(side * side * 4)
+    print(f'{name}: fetching {side} rows', flush=True)
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-        for offset, data in pool.map(fetch_rows, range(0, SIDE, 64)):
-            rows[offset * SIDE * 4:offset * SIDE * 4 + len(data)] = data
-    samples = struct.unpack('<' + 'f' * (SIDE * SIDE), rows)
+        for offset, data in pool.map(fetch_rows, range(0, side, 64)):
+            rows[offset * side * 4:offset * side * 4 + len(data)] = data
+            if offset % 512 == 0:
+                print(f'{name}: {offset}/{side} rows', flush=True)
+    samples = array.array('f')
+    samples.frombytes(rows)
+    if sys.byteorder != 'little':
+        samples.byteswap()
     heights = []
-    for y in range(0, SIDE, 2):
-        for x in range(0, SIDE, 2):
-            i = y * SIDE + x
-            value = sum(samples[j] for j in (i, i + 1, i + SIDE, i + SIDE + 1)) * 250
-            if not math.isfinite(value) or not -12000 < value < 12000:
-                raise ValueError(f'Invalid elevation at {x}, {y}: {value}')
-            heights.append(round(value))
+    for y in range(0, side, factor):
+        for x in range(0, side, factor):
+            value = 0
+            for dy in range(factor):
+                for dx in range(factor):
+                    sample = samples[(y + dy) * side + x + dx] * 1000
+                    if not math.isfinite(sample) or not -12000 < sample < 12000:
+                        raise ValueError(f'Invalid elevation at {x}, {y}: {sample}')
+                    value += sample
+            heights.append(round(value / (factor * factor)))
     raw = struct.pack('<' + 'h' * len(heights), *heights)
-    metadata = dict(source=BASE + PRODUCT + '.IMG', label=BASE + PRODUCT + '.LBL',
+    metadata = dict(source=BASE + product + '.IMG', label=BASE + product + '.LBL',
                     citation='Barker et al. (2016), Icarus 273, 346-355, doi:10.1016/j.icarus.2015.07.039',
-                    width=SIDE // 2, height=SIDE // 2, north=15, south=5, west=335, east=345,
-                    radius=1737400, centerLatitude=10, centerLongitude=340,
+                    width=side // factor, height=side // factor, north=north, south=south, west=west, east=east,
+                    radius=1737400, centerLatitude=(north + south) / 2, centerLongitude=(west + east) / 2,
                     min=min(heights), max=max(heights), sha256=hashlib.sha256(raw).hexdigest(),
                     sourceCropSha256=hashlib.sha256(rows).hexdigest(),
-                    encoding='gzip, little-endian int16 metres; north-to-south rows; 2x2 average')
-    encoded = base64.b64encode(gzip.compress(raw, mtime=0)).decode()
-    out = ROOT / 'js' / 'moon-data.js'
-    out.write_text('// Generated by tools/prepare-moon.py. NASA/GSFC/MIT SLDEM2015.\n'
-                   + 'export const MOON_DEM = ' + json.dumps(metadata, indent=2) + ';\n'
-                   + 'export const MOON_DEM_GZIP = ' + json.dumps(encoded) + ';\n', encoding='utf-8', newline='\n')
-    print(json.dumps(metadata, indent=2))
-    print(f'Wrote {out}: {out.stat().st_size} bytes')
+                    encoding=f'gzip, little-endian int16 metres; north-to-south rows; {factor}x{factor} average')
+    write_asset(name, metadata, raw)
 
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('regions', nargs='*', help='Region names: ' + ', '.join(REGIONS))
+    parser.add_argument('--all', action='store_true')
+    parser.add_argument('--repack', action='store_true', help='Losslessly compress existing assets without source downloads')
+    args = parser.parse_args()
+    names = list(REGIONS) if args.all else args.regions or ['copernicus']
+    if any(name not in REGIONS for name in names):
+        parser.error('Unknown region')
+    for name in names:
+        repack(name) if args.repack else prepare(name)
