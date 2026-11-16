@@ -120,7 +120,13 @@ export const P = {
   rainLightning: 0,
   music: false,
   musicVolume: 100,
+  musicTrack: 'track001',
 };
+// Sound → Track. Shuffle plays the other file when the current one ends.
+const MUSIC_TRACKS = [
+  { id: 'track001', file: 'media/track001.mp3', name: 'Soft Fiano' },
+  { id: 'track002', file: 'media/track002.mp3', name: 'Sustained Open Chord' },
+];
 const DEFAULTS = { ...P };
 
 const loadingEl = document.getElementById('loading');
@@ -1704,7 +1710,8 @@ async function main() {
     'sceneLabel', 'sceneSky', 'autopilot', 'moon', 'stars', 'cloudMotion', 'rain', 'rainFollow', 'music']);
   const STRING_KEYS = new Set(['clockStyle', 'clockColor', 'clockPosition', 'weatherZip', 'weatherUnit', 'weatherPosition',
     'sceneMode', 'scene', 'tourOrder', 'lookMode',
-    'skyMode', 'zipCode', 'skyWhen', 'skyLapseStart', 'cloudMode', 'starMode', 'rainMode', 'rainStyle']);
+    'skyMode', 'zipCode', 'skyWhen', 'skyLapseStart', 'cloudMode', 'starMode', 'rainMode', 'rainStyle',
+    'musicTrack']);
   const SUN_DRIVEN = ['sunElev', 'sunAzim'];
   const CLOUD_DRIVEN = [
     'cloudMotion', 'cloudWindSpeed', 'cloudWindDir', 'cloudEvolution',
@@ -1747,6 +1754,10 @@ async function main() {
     { title: 'Sound', groups: [
       { settings: [
         ['music', 'Background music', 'toggle', 'On', 'Off'],
+        ['musicTrack', 'Track', 'select', [
+          ...MUSIC_TRACKS.map((track) => [track.id, track.name]),
+          ['shuffle', 'Shuffle'],
+        ]],
         ['musicVolume', 'Volume', 0, 100, 1, 'music'],
       ] },
     ] },
@@ -2117,22 +2128,44 @@ async function main() {
     panel.style.maxHeight = P.showButtons ? 'calc(100vh - 60px)' : 'calc(100vh - 20px)';
     placeClock();
   }
-  // Deployed next to the page as media/track001.mp3. loop restarts the file at the end;
-  // the ended handler covers players that ignore the loop flag.
-  const soundtrack = new Audio('media/track001.mp3');
-  soundtrack.loop = true;
+  // A chosen track loops. Shuffle leaves loop off and starts the other file when
+  // this one ends, so the same piece does not play twice in a row. The ended handler
+  // also covers players that ignore the loop flag.
+  const soundtrack = new Audio();
   soundtrack.preload = 'auto';
   soundtrack.hidden = true;
   document.body.append(soundtrack);
-  let musicErrorLogged = false;
+  let musicFile = '';
+  let musicFallbackTried = false;
+  const musicErrorsLogged = new Set();
+  function musicFileFor(id) {
+    return MUSIC_TRACKS.find((track) => track.id === id)?.file || MUSIC_TRACKS[0].file;
+  }
+  function nextShuffleFile(avoidRepeat) {
+    const choices = MUSIC_TRACKS.map((track) => track.file).filter((file) => !avoidRepeat || file !== musicFile);
+    return choices[Math.floor(Math.random() * choices.length)] || MUSIC_TRACKS[0].file;
+  }
+  function assignMusicFile(file) {
+    soundtrack.loop = P.musicTrack !== 'shuffle';
+    if (musicFile === file) return false;
+    musicFile = file;
+    soundtrack.src = file;
+    return true;
+  }
+  function logMusicProblem(err, file = musicFile || MUSIC_TRACKS[0].file) {
+    if (musicErrorsLogged.has(file)) return;
+    musicErrorsLogged.add(file);
+    const detail = err && err.message ? err.message : err;
+    log(detail ? `music: ${detail} (${file})` : `music: could not load ${file}`);
+  }
   function playSoundtrack() {
+    if (!musicFile) assignMusicFile(P.musicTrack === 'shuffle' ? nextShuffleFile(false) : musicFileFor(P.musicTrack));
+    soundtrack.loop = P.musicTrack !== 'shuffle';
     const pending = soundtrack.play();
     if (!pending) return;
     pending.catch((err) => {
-      if (err && err.name === 'NotAllowedError') return;
-      if (musicErrorLogged) return;
-      musicErrorLogged = true;
-      log('music: ' + (err && err.message ? err.message : err));
+      if (err && (err.name === 'NotAllowedError' || err.name === 'AbortError')) return;
+      logMusicProblem(err);
     });
   }
   function applyMusicVolume() {
@@ -2140,21 +2173,52 @@ async function main() {
   }
   function applyMusic() {
     applyMusicVolume();
+    soundtrack.loop = P.musicTrack !== 'shuffle';
+    if (P.musicTrack !== 'shuffle') assignMusicFile(musicFileFor(P.musicTrack));
+    else if (!musicFile) assignMusicFile(nextShuffleFile(false));
     if (!P.music) {
       soundtrack.pause();
       return;
     }
     playSoundtrack();
   }
+  function applyMusicTrack() {
+    musicFallbackTried = false;
+    soundtrack.loop = P.musicTrack !== 'shuffle';
+    if (P.musicTrack === 'shuffle') {
+      // A track that has not started yet can begin on either file. One already
+      // playing finishes, then the other file follows.
+      const atStart = !musicFile || (soundtrack.paused && soundtrack.currentTime < 0.25);
+      if (atStart) assignMusicFile(nextShuffleFile(false));
+      if (P.music && soundtrack.paused) playSoundtrack();
+      return;
+    }
+    const changed = assignMusicFile(musicFileFor(P.musicTrack));
+    if (P.music && (changed || soundtrack.paused)) playSoundtrack();
+  }
   soundtrack.addEventListener('ended', () => {
     if (!P.music) return;
+    if (P.musicTrack === 'shuffle') {
+      assignMusicFile(nextShuffleFile(true));
+      playSoundtrack();
+      return;
+    }
     soundtrack.currentTime = 0;
     playSoundtrack();
   });
+  soundtrack.addEventListener('playing', () => { musicFallbackTried = false; });
   soundtrack.addEventListener('error', () => {
-    if (musicErrorLogged) return;
-    musicErrorLogged = true;
-    log('music: could not load media/track001.mp3');
+    const failed = musicFile;
+    if (P.music && P.musicTrack === 'shuffle' && !musicFallbackTried) {
+      const other = MUSIC_TRACKS.map((track) => track.file).find((file) => file !== failed);
+      if (other) {
+        musicFallbackTried = true;
+        assignMusicFile(other);
+        playSoundtrack();
+        return;
+      }
+    }
+    logMusicProblem(null, failed);
   });
   // A saved "on" can load before the browser will allow sound. The next click or key starts it.
   // The music button handles its own gesture, so a press that turns music off is not also a resume.
@@ -3341,6 +3405,7 @@ async function main() {
       }
       if (key === 'starMode') applyStarMode();
       if (key === 'lookMode') applyLookButton();
+      if (key === 'musicTrack') applyMusicTrack();
       if (key === 'sceneMode') {
         shuffleBag.length = 0;
         applySceneControls();
