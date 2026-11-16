@@ -1,0 +1,65 @@
+name: Bug report
+description: Something renders wrong, crashes, or doesn't start.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. If the page says **WebGPU is not available**, please check [browser support](https://github.com/jfayling/fayling-web-scenery-pictureframe/blob/main/docs/browser-support.md) and [troubleshooting](https://github.com/jfayling/fayling-web-scenery-pictureframe/blob/main/docs/troubleshooting.md) first.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you saw, and what you expected instead.
+    validations:
+      required: true
+  - type: input
+    id: url
+    attributes:
+      label: URL or scene
+      description: The full URL including query parameters, or the region name shown on screen.
+      placeholder: https://jfayling.github.io/fayling-web-scenery-pictureframe/?scene=alpine
+  - type: dropdown
+    id: entry
+    attributes:
+      label: How did you run it?
+      options:
+        - Live demo (GitHub Pages)
+        - scenery.html opened from disk
+        - scenery.min.html opened from disk
+        - npm start (dev server)
+    validations:
+      required: true
+  - type: input
+    id: browser
+    attributes:
+      label: Browser and version
+      placeholder: Chrome 142.0.7444.60
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: Windows 11 24H2
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU
+      description: From chrome://gpu, or your system settings. Mention whether it's integrated or dedicated.
+      placeholder: NVIDIA GeForce RTX 3060 Laptop GPU
+    validations:
+      required: true
+  - type: textarea
+    id: console
+    attributes:
+      label: Console output
+      description: Open DevTools (F12) → Console and paste any errors.
+      render: text
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots
+      description: Drag images here. A screenshot with `dbg=1` to `dbg=4` added to the URL can help with terrain or lighting bugs.

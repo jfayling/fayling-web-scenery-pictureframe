@@ -1,0 +1,35 @@
+name: Feature request
+description: Suggest a new region, effect, widget, or improvement.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would you like?
+      description: For a new region, describe the real landscape and link reference photos if you can.
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why?
+      description: What would this add for someone running the frame on a big screen?
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - New Earth region
+        - New lunar or planetary terrain
+        - Rendering (terrain, trees, water, sky, weather)
+        - Camera and flight
+        - Settings, widgets, or UI
+        - Performance
+        - Documentation
+        - Other
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Project constraints
+      options:
+        - label: This doesn't need a runtime dependency or a server, or I've explained why it does.

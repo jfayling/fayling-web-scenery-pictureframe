@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Browser support and troubleshooting
+    url: https://github.com/jfayling/fayling-web-scenery-pictureframe/blob/main/docs/troubleshooting.md
+    about: WebGPU not available, black screen, low frame rate, or the integrated GPU is being used.

@@ -1,4 +1,7 @@
 node_modules/
+# GitHub Pages output (tools/build-site.mjs) and release staging
+_site/
+release/
 # local screenshot captures written by server.mjs (/__shot) and test shots
 shots/
 # local tooling

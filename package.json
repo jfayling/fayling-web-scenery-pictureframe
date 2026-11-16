@@ -1,13 +1,22 @@
 {
   "name": "fayling-web-scenery-pictureframe",
   "version": "1.0.0",
-  "description": "Large-screen WebGPU aerial scenery picture frame: procedural forested landscapes seen from a slow flight, with a physically based sky, clock, and live weather.",
+  "description": "Real-time WebGPU cinematic scenery screensaver featuring procedural landscapes, autonomous aerial flyovers, forests, mountains, canyons, and lunar terrain.",
   "license": "MIT",
   "private": true,
   "type": "module",
+  "homepage": "https://jfayling.github.io/fayling-web-scenery-pictureframe/",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jfayling/fayling-web-scenery-pictureframe.git"
+  },
+  "bugs": "https://github.com/jfayling/fayling-web-scenery-pictureframe/issues",
+  "keywords": ["webgpu", "wgsl", "procedural-generation", "terrain-generation", "screensaver", "landscape", "shader", "generative-art"],
   "scripts": {
     "start": "node server.mjs",
-    "build": "node build.mjs"
+    "build": "node build.mjs",
+    "test": "node --test tools/camera-route.test.mjs tools/lunar-terrain.test.mjs",
+    "site": "node build.mjs && node tools/build-site.mjs"
   },
   "devDependencies": {
     "esbuild": "^0.25.0"

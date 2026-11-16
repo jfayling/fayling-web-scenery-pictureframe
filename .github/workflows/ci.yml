@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Build standalone bundles
+        run: npm run build
+
+      - name: Committed bundles match the sources
+        run: |
+          if ! git diff --quiet -- scenery.html scenery.min.html; then
+            echo "::error::scenery.html / scenery.min.html are out of date. Run 'npm run build' and commit the result."
+            git diff --stat -- scenery.html scenery.min.html
+            exit 1
+          fi
+
+      - name: Unit tests (camera routes, lunar terrain decoding)
+        run: npm test
+
+      - name: Assemble and check the Pages site
+        run: node tools/build-site.mjs

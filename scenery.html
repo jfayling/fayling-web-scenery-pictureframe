@@ -3,7 +3,25 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Fayling Scenery Picture Frame</title>
+<title>Fayling Scenery · Real-time WebGPU aerial landscapes</title>
+<meta name="description" content="A cinematic WebGPU screensaver: an autonomous camera flies over procedural forests, mountains, rivers, coasts, and canyons, plus five lunar regions built from measured NASA elevation data. Runs in the browser, no videos.">
+<meta name="theme-color" content="#0b0f14">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230b0f14'/%3E%3Cpath d='M3 25l8-12 5 7 4-5 9 10z' fill='%23e2a04e'/%3E%3C/svg%3E">
+<link rel="canonical" href="https://jfayling.github.io/fayling-web-scenery-pictureframe/">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Fayling Living Frames">
+<meta property="og:title" content="Fayling Scenery · Real-time WebGPU aerial landscapes">
+<meta property="og:description" content="Autonomous aerial flyovers of procedural forests, mountains, coasts, canyons, and measured lunar terrain, rendered live in your browser with WebGPU.">
+<meta property="og:url" content="https://jfayling.github.io/fayling-web-scenery-pictureframe/">
+<meta property="og:image" content="https://jfayling.github.io/fayling-web-scenery-pictureframe/docs/social-preview.png">
+<meta property="og:image:width" content="1280">
+<meta property="og:image:height" content="640">
+<meta property="og:image:alt" content="Aerial view of a procedurally generated glacial valley with waterfalls, rendered in real time with WebGPU">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Fayling Scenery · Real-time WebGPU aerial landscapes">
+<meta name="twitter:description" content="Autonomous aerial flyovers of procedural landscapes and measured lunar terrain, rendered live with WebGPU.">
+<meta name="twitter:image" content="https://jfayling.github.io/fayling-web-scenery-pictureframe/docs/social-preview.png">
+<meta name="twitter:image:alt" content="Aerial view of a procedurally generated glacial valley with waterfalls, rendered in real time with WebGPU">
 <style>
   html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
   #c { position: fixed; inset: 0; width: 100%; height: 100%; display: block; cursor: grab; }
@@ -6113,8 +6131,19 @@ function fail(msg) {
   const el = document.getElementById('err');
   el.style.display = 'block';
   el.textContent = msg;
+  if (!navigator.gpu || /adapter/i.test(msg)) {
+    const help = document.createElement('p');
+    help.style.color = '#e5e1d8';
+    help.append('This picture frame needs WebGPU and a capable GPU. Desktop Chrome or Edge works best. ');
+    const link = document.createElement('a');
+    link.href = 'https://github.com/jfayling/fayling-web-scenery-pictureframe/blob/main/docs/browser-support.md';
+    link.textContent = 'Browser support and troubleshooting';
+    link.style.color = '#e2a04e';
+    help.append(link);
+    el.append(help);
+  }
   log('FATAL ' + msg);
-  throw new Error(msg);
+  throw Object.assign(new Error(msg), { shown: true });
 }
 function log(msg) {
   console.log(msg);
@@ -9521,6 +9550,7 @@ async function main() {
   const submitList = [null];
   const shotFrames = Number(qs.get('frames')) || 240;
   const shotSeq = Number(qs.get('seq')) || 1;
+  const shotStep = Math.max(1, Number(qs.get('step')) || 1);
   let shotIdx = 0;
   const fixedDt = shotName ? 1 / 60 : 0;
   let last = performance.now();
@@ -9798,7 +9828,7 @@ async function main() {
       doTs = true;
     }
     let readBuf = null;
-    if (shotName && shotIdx < shotSeq && tour.state === 'run' && frameIndex >= shotFrames + shotIdx) {
+    if (shotName && shotIdx < shotSeq && tour.state === 'run' && frameIndex >= shotFrames + shotIdx * shotStep) {
       shooting = true;
       const bpr = Math.ceil(W * 4 / 256) * 256;
       readBuf = device.createBuffer({ size: bpr * H, usage: GU.MAP_READ | GU.COPY_DST });
@@ -9857,6 +9887,7 @@ async function main() {
 }
 
 main().catch((e) => {
+  if (e?.shown) return;
   dropLoad();
   const msg = 'init failed: ' + (e && e.stack || e);
   const el = document.getElementById('err');

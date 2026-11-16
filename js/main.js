@@ -174,8 +174,19 @@ function fail(msg) {
   const el = document.getElementById('err');
   el.style.display = 'block';
   el.textContent = msg;
+  if (!navigator.gpu || /adapter/i.test(msg)) {
+    const help = document.createElement('p');
+    help.style.color = '#e5e1d8';
+    help.append('This picture frame needs WebGPU and a capable GPU. Desktop Chrome or Edge works best. ');
+    const link = document.createElement('a');
+    link.href = 'https://github.com/jfayling/fayling-web-scenery-pictureframe/blob/main/docs/browser-support.md';
+    link.textContent = 'Browser support and troubleshooting';
+    link.style.color = '#e2a04e';
+    help.append(link);
+    el.append(help);
+  }
   log('FATAL ' + msg);
-  throw new Error(msg);
+  throw Object.assign(new Error(msg), { shown: true });
 }
 function log(msg) {
   console.log(msg);
@@ -3582,6 +3593,7 @@ async function main() {
   const submitList = [null];
   const shotFrames = Number(qs.get('frames')) || 240;
   const shotSeq = Number(qs.get('seq')) || 1;
+  const shotStep = Math.max(1, Number(qs.get('step')) || 1);
   let shotIdx = 0;
   const fixedDt = shotName ? 1 / 60 : 0;
   let last = performance.now();
@@ -3859,7 +3871,7 @@ async function main() {
       doTs = true;
     }
     let readBuf = null;
-    if (shotName && shotIdx < shotSeq && tour.state === 'run' && frameIndex >= shotFrames + shotIdx) {
+    if (shotName && shotIdx < shotSeq && tour.state === 'run' && frameIndex >= shotFrames + shotIdx * shotStep) {
       shooting = true;
       const bpr = Math.ceil(W * 4 / 256) * 256;
       readBuf = device.createBuffer({ size: bpr * H, usage: GU.MAP_READ | GU.COPY_DST });
@@ -3918,6 +3930,7 @@ async function main() {
 }
 
 main().catch((e) => {
+  if (e?.shown) return;
   dropLoad();
   const msg = 'init failed: ' + (e && e.stack || e);
   const el = document.getElementById('err');
